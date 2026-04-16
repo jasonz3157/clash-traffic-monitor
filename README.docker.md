@@ -1,9 +1,8 @@
 # Traffic Monitor
 
-`Traffic Monitor` 是一个用于 Mihomo 的轻量流量监控镜像。
+`Traffic Monitor` 是一个独立运行的 Clash Mihomo 内核 流量监控服务。
 
-容器启动后会持续采集 Mihomo 的连接流量，并在 `8080` 端口提供 Web 页面，方便查看设备、主机、代理维度的流量数据。
-
+它会定时读取  Clash Mihomo 内核 的 `/connections` 数据，把流量增量先聚合到内存，再按分钟桶批量写入 SQLite，并提供一个内置 Web 页面，用来查看设备、主机、代理维度的流量统计和链路明细。
 ## 怎么用
 
 ```bash
@@ -29,14 +28,7 @@ http://localhost:8080/
 | --- | --- | --- |
 | `MIHOMO_URL` | `http://127.0.0.1:9090` | Mihomo Controller 地址 |
 | `MIHOMO_SECRET` | 空 | Mihomo Bearer Token |
-| `TRAFFIC_MONITOR_LISTEN` | `:8080` | 服务监听地址 |
-
-## 存储说明
-
-- 容器内数据库文件固定为 `/data/traffic_monitor.db`，因此持久化时应挂载到 `/data`。
-- 本地直接运行二进制时，默认路径会切换到 `./data/traffic_monitor.db`，不会去写根目录 `/data`。
-- 运行时只持久化 30 天分钟级聚合数据。
-- 最近最多 10 分钟的数据先保存在内存里，按批次刷盘，以减少磁盘 IO。
+| `TRAFFIC_MONITOR_DB` | `./traffic_monitor.db` | 数据库路径 |
 
 ## 页面预览
 
