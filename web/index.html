@@ -801,9 +801,10 @@
               <div class="toolbar-field">
                 <label for="range">范围</label>
                 <select id="range">
-                  <option value="3600000">最近 1 小时</option>
-                  <option value="86400000">最近 24 小时</option>
-                  <option value="2592000000">最近 30 天</option>
+                  <option value="86400000">1 天</option>
+                  <option value="604800000" selected>7 天</option>
+                  <option value="1296000000">15 天</option>
+                  <option value="2592000000">30 天</option>
                   <option value="-1">自定义</option>
                 </select>
               </div>
@@ -821,7 +822,6 @@
           </div>
         </div>
       </section>
-
       <section class="cards">
         <div class="panel card">
           <div class="card-top">

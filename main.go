@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,6 +101,22 @@ type service struct {
 	lastUploadTotal   int64
 	lastDownloadTotal int64
 	lastCleanup       time.Time
+	lastVacuum        time.Time
+	aggregateBuffer   map[string]*aggregatedEntry
+}
+
+type aggregatedEntry struct {
+	BucketStart   int64
+	BucketEnd     int64
+	SourceIP      string
+	Host          string
+	DestinationIP string
+	Process       string
+	Outbound      string
+	Chains        string
+	Upload        int64
+	Download      int64
+	Count         int64
 }
 
 func main() {
@@ -119,12 +136,18 @@ func main() {
 		client:          &http.Client{Timeout: 10 * time.Second},
 		cfg:             cfg,
 		lastConnections: make(map[string]connection),
+		lastVacuum:      time.Now(),
+		aggregateBuffer: make(map[string]*aggregatedEntry),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go svc.runCollector(ctx)
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		svc.runCollector(ctx)
+	}()
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -144,6 +167,14 @@ func main() {
 	<-sigCh
 
 	cancel()
+	select {
+	case <-collectorDone:
+	case <-time.After(5 * time.Second):
+		log.Printf("collector shutdown timed out")
+	}
+	if err := svc.flushAggregateBuffer(); err != nil {
+		log.Printf("flush aggregate buffer on shutdown: %v", err)
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -162,9 +193,9 @@ func loadConfig() (config, error) {
 		AllowedOrigin: getenv("TRAFFIC_MONITOR_ALLOWED_ORIGIN", "*"),
 	}
 
-	pollMS := getenvInt("TRAFFIC_MONITOR_POLL_INTERVAL_MS", 2000)
-	if pollMS < 500 {
-		pollMS = 500
+	pollMS := getenvInt("TRAFFIC_MONITOR_POLL_INTERVAL_MS", 5000)
+	if pollMS < 1000 {
+		pollMS = 1000
 	}
 	cfg.PollInterval = time.Duration(pollMS) * time.Millisecond
 
@@ -198,11 +229,33 @@ func openDatabase(path string) (*sql.DB, error) {
 		download INTEGER NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS traffic_aggregated (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		bucket_start INTEGER NOT NULL,
+		bucket_end INTEGER NOT NULL,
+		source_ip TEXT NOT NULL,
+		host TEXT NOT NULL,
+		destination_ip TEXT NOT NULL DEFAULT '',
+		process TEXT NOT NULL,
+		outbound TEXT NOT NULL,
+		chains TEXT NOT NULL DEFAULT '[]',
+		upload INTEGER NOT NULL,
+		download INTEGER NOT NULL,
+		count INTEGER NOT NULL,
+		UNIQUE(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_timestamp ON traffic_logs(timestamp);
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_source_ip ON traffic_logs(source_ip);
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_host ON traffic_logs(host);
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_process ON traffic_logs(process);
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_outbound ON traffic_logs(outbound);
+
+	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_bucket ON traffic_aggregated(bucket_start, bucket_end);
+	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_source_ip ON traffic_aggregated(source_ip);
+	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_host ON traffic_aggregated(host);
+	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_process ON traffic_aggregated(process);
+	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_outbound ON traffic_aggregated(outbound);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -220,7 +273,57 @@ func openDatabase(path string) (*sql.DB, error) {
 		}
 	}
 
+	currentBucketStart := (time.Now().UnixMilli() / 60000) * 60000
+	if err := backfillAggregatedLogs(db, currentBucketStart); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return db, nil
+}
+
+func backfillAggregatedLogs(db *sql.DB, beforeMS int64) error {
+	if beforeMS <= 0 {
+		return nil
+	}
+
+	var lastBucketEnd sql.NullInt64
+	if err := db.QueryRow(`SELECT MAX(bucket_end) FROM traffic_aggregated`).Scan(&lastBucketEnd); err != nil {
+		return err
+	}
+
+	startMS := int64(0)
+	if lastBucketEnd.Valid {
+		startMS = lastBucketEnd.Int64
+	}
+	if startMS >= beforeMS {
+		return nil
+	}
+
+	_, err := db.Exec(`
+		INSERT INTO traffic_aggregated
+		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
+		SELECT ((timestamp / 60000) * 60000) AS bucket_start,
+		       ((timestamp / 60000) * 60000) + 60000 AS bucket_end,
+		       source_ip,
+		       host,
+		       destination_ip,
+		       process,
+		       outbound,
+		       chains,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COUNT(*) AS count
+		FROM traffic_logs
+		WHERE timestamp >= ? AND timestamp < ?
+		GROUP BY bucket_start, source_ip, host, destination_ip, process, outbound, chains
+		ON CONFLICT(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
+		DO UPDATE SET
+			upload = excluded.upload,
+			download = excluded.download,
+			count = excluded.count
+	`, startMS, beforeMS)
+	return err
 }
 
 func (s *service) runCollector(ctx context.Context) {
@@ -283,8 +386,6 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 	nowMS := time.Now().UnixMilli()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if payload.UploadTotal < s.lastUploadTotal || payload.DownloadTotal < s.lastDownloadTotal {
 		log.Printf("detected Mihomo counter reset, clearing in-memory baselines")
 		s.lastConnections = make(map[string]connection)
@@ -339,13 +440,20 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 			delete(s.lastConnections, id)
 		}
 	}
+	s.mu.Unlock()
 
-	if len(logs) == 0 {
-		return nil
+	if len(logs) > 0 {
+		if err := s.insertLogs(logs); err != nil {
+			return err
+		}
+
+		if err := s.addToAggregateBuffer(logs, nowMS); err != nil {
+			return err
+		}
 	}
 
-	if err := s.insertLogs(logs); err != nil {
-		return err
+	if err := s.flushCompletedAggregateBuckets(nowMS); err != nil {
+		log.Printf("flush aggregate buffer: %v", err)
 	}
 
 	if s.cfg.RetentionDays > 0 && time.Since(s.lastCleanup) >= time.Hour {
@@ -403,8 +511,141 @@ func (s *service) insertLogs(logs []trafficLog) error {
 
 func (s *service) cleanupOldLogs(nowMS int64) error {
 	cutoff := nowMS - int64(time.Duration(s.cfg.RetentionDays)*24*time.Hour/time.Millisecond)
-	_, err := s.db.Exec(`DELETE FROM traffic_logs WHERE timestamp < ?`, cutoff)
-	return err
+
+	// 删除旧日志
+	if _, err := s.db.Exec(`DELETE FROM traffic_logs WHERE timestamp < ?`, cutoff); err != nil {
+		return err
+	}
+
+	// 删除旧聚合数据（保留更长时间）
+	aggCutoff := nowMS - int64(time.Duration(s.cfg.RetentionDays*2)*24*time.Hour/time.Millisecond)
+	if _, err := s.db.Exec(`DELETE FROM traffic_aggregated WHERE bucket_end < ?`, aggCutoff); err != nil {
+		return err
+	}
+
+	// 定期执行VACUUM（每周一次）
+	if time.Since(s.lastVacuum) >= 7*24*time.Hour {
+		if _, err := s.db.Exec(`VACUUM`); err != nil {
+			log.Printf("VACUUM failed: %v", err)
+		} else {
+			s.lastVacuum = time.Now()
+		}
+	}
+
+	return nil
+}
+
+func (s *service) addToAggregateBuffer(logs []trafficLog, nowMS int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bucketStart := (nowMS / 60000) * 60000 // 1分钟桶
+	bucketEnd := bucketStart + 60000
+
+	for _, log := range logs {
+		key := fmt.Sprintf("%d-%s-%s-%s-%s-%s-%s", bucketStart, log.SourceIP, log.Host, log.DestinationIP, log.Process, log.Outbound, strings.Join(log.Chains, ","))
+
+		if entry, exists := s.aggregateBuffer[key]; exists {
+			entry.Upload += log.Upload
+			entry.Download += log.Download
+			entry.Count++
+		} else {
+			chainsJSON, err := json.Marshal(sanitizeChains(log.Chains))
+			if err != nil {
+				return err
+			}
+			s.aggregateBuffer[key] = &aggregatedEntry{
+				BucketStart:   bucketStart,
+				BucketEnd:     bucketEnd,
+				SourceIP:      log.SourceIP,
+				Host:          log.Host,
+				DestinationIP: log.DestinationIP,
+				Process:       log.Process,
+				Outbound:      log.Outbound,
+				Chains:        string(chainsJSON),
+				Upload:        log.Upload,
+				Download:      log.Download,
+				Count:         1,
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *service) flushCompletedAggregateBuckets(nowMS int64) error {
+	currentBucketStart := (nowMS / 60000) * 60000
+	return s.flushAggregateEntries(func(entry *aggregatedEntry) bool {
+		return entry.BucketEnd <= currentBucketStart
+	})
+}
+
+func (s *service) flushAggregateBuffer() error {
+	return s.flushAggregateEntries(func(*aggregatedEntry) bool {
+		return true
+	})
+}
+
+func (s *service) flushAggregateEntries(shouldFlush func(*aggregatedEntry) bool) error {
+	buffer := s.snapshotAggregateEntries(shouldFlush)
+	if len(buffer) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO traffic_aggregated
+		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
+		DO UPDATE SET
+			upload = traffic_aggregated.upload + excluded.upload,
+			download = traffic_aggregated.download + excluded.download,
+			count = traffic_aggregated.count + excluded.count
+	`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+
+	for _, entry := range buffer {
+		if _, err := stmt.Exec(
+			entry.BucketStart, entry.BucketEnd, entry.SourceIP, entry.Host, entry.DestinationIP,
+			entry.Process, entry.Outbound, entry.Chains, entry.Upload, entry.Download, entry.Count,
+		); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key := range buffer {
+		delete(s.aggregateBuffer, key)
+	}
+	return nil
+}
+
+func (s *service) snapshotAggregateEntries(shouldFlush func(*aggregatedEntry) bool) map[string]aggregatedEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	buffer := make(map[string]aggregatedEntry)
+	for key, entry := range s.aggregateBuffer {
+		if shouldFlush(entry) {
+			buffer[key] = *entry
+		}
+	}
+	return buffer
 }
 
 func (s *service) routes() http.Handler {
@@ -642,10 +883,30 @@ func (s *service) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.db.Exec(`DELETE FROM traffic_logs`); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+
+	if _, err := tx.Exec(`DELETE FROM traffic_logs`); err != nil {
+		tx.Rollback()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM traffic_aggregated`); err != nil {
+		tx.Rollback()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	s.mu.Lock()
+	s.aggregateBuffer = make(map[string]*aggregatedEntry)
+	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -681,40 +942,41 @@ func (s *service) queryProxyStats(dimension, parentLabel, host string, start, en
 }
 
 func (s *service) queryByFilters(groupColumn, extraFilter string, extraArgs []any, start, end int64) ([]aggregatedData, error) {
-	base := `
-		SELECT ` + groupColumn + ` AS label,
-		       COALESCE(SUM(upload), 0) AS upload,
-		       COALESCE(SUM(download), 0) AS download,
-		       COALESCE(SUM(upload + download), 0) AS total,
-		       COUNT(*) AS count
-		FROM traffic_logs
-		WHERE timestamp BETWEEN ? AND ?
-	`
-	args := []any{start, end}
-	if extraFilter != "" {
-		base += " AND " + extraFilter
-		args = append(args, extraArgs...)
+	timeRange := end - start
+	if timeRange <= 3600000 {
+		return s.queryByFiltersFromRaw(groupColumn, extraFilter, extraArgs, start, end)
 	}
-	base += `
-		GROUP BY ` + groupColumn + `
-		ORDER BY total DESC, label ASC
-	`
 
-	rows, err := s.db.Query(base, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	merged := make(map[string]*aggregatedData)
+	aggregateStart, aggregateEndExclusive := fullMinuteBucketRange(start, end)
 
-	results := make([]aggregatedData, 0)
-	for rows.Next() {
-		var item aggregatedData
-		if err := rows.Scan(&item.Label, &item.Upload, &item.Download, &item.Total, &item.Count); err != nil {
+	if aggregateStart < aggregateEndExclusive {
+		items, err := s.queryByFiltersFromAggregates(groupColumn, extraFilter, extraArgs, aggregateStart, aggregateEndExclusive)
+		if err != nil {
 			return nil, err
 		}
-		results = append(results, item)
+		mergeAggregatedDataRows(merged, items)
 	}
-	return results, rows.Err()
+
+	headEnd := minInt64(end, aggregateStart-1)
+	if start <= headEnd {
+		items, err := s.queryByFiltersFromRaw(groupColumn, extraFilter, extraArgs, start, headEnd)
+		if err != nil {
+			return nil, err
+		}
+		mergeAggregatedDataRows(merged, items)
+	}
+
+	tailStart := maxInt64(start, aggregateEndExclusive)
+	if tailStart <= end {
+		items, err := s.queryByFiltersFromRaw(groupColumn, extraFilter, extraArgs, tailStart, end)
+		if err != nil {
+			return nil, err
+		}
+		mergeAggregatedDataRows(merged, items)
+	}
+
+	return sortedAggregatedDataRows(merged), nil
 }
 
 func (s *service) queryConnectionDetails(dimension, primary, secondary string, start, end int64) ([]connectionDetail, error) {
@@ -770,6 +1032,117 @@ func (s *service) queryConnectionDetails(dimension, primary, secondary string, s
 }
 
 func (s *service) queryTrend(start, end, bucket int64) ([]trendPoint, error) {
+	buckets := make(map[int64]trendPoint)
+
+	if bucket >= 60000 {
+		aggregateStart, aggregateEndExclusive := fullMinuteBucketRange(start, end)
+		if aggregateStart < aggregateEndExclusive {
+			items, err := s.queryTrendFromAggregates(aggregateStart, aggregateEndExclusive, bucket)
+			if err != nil {
+				return nil, err
+			}
+			mergeTrendPoints(buckets, items)
+		}
+
+		headEnd := minInt64(end, aggregateStart-1)
+		if start <= headEnd {
+			items, err := s.queryTrendFromRaw(start, headEnd, bucket)
+			if err != nil {
+				return nil, err
+			}
+			mergeTrendPoints(buckets, items)
+		}
+
+		tailStart := maxInt64(start, aggregateEndExclusive)
+		if tailStart <= end {
+			items, err := s.queryTrendFromRaw(tailStart, end, bucket)
+			if err != nil {
+				return nil, err
+			}
+			mergeTrendPoints(buckets, items)
+		}
+	} else {
+		items, err := s.queryTrendFromRaw(start, end, bucket)
+		if err != nil {
+			return nil, err
+		}
+		mergeTrendPoints(buckets, items)
+	}
+
+	points := make([]trendPoint, 0, (end-start)/bucket+1)
+	for t := start; t <= end; t += bucket {
+		key := (t / bucket) * bucket
+		if point, ok := buckets[key]; ok {
+			points = append(points, point)
+			continue
+		}
+		points = append(points, trendPoint{Timestamp: key})
+	}
+	return points, nil
+}
+
+func (s *service) queryByFiltersFromRaw(groupColumn, extraFilter string, extraArgs []any, start, end int64) ([]aggregatedData, error) {
+	return s.queryByFiltersFromTable(
+		"traffic_logs",
+		"timestamp BETWEEN ? AND ?",
+		[]any{start, end},
+		groupColumn,
+		extraFilter,
+		extraArgs,
+		"COUNT(*)",
+	)
+}
+
+func (s *service) queryByFiltersFromAggregates(groupColumn, extraFilter string, extraArgs []any, start, endExclusive int64) ([]aggregatedData, error) {
+	return s.queryByFiltersFromTable(
+		"traffic_aggregated",
+		"bucket_start >= ? AND bucket_start < ?",
+		[]any{start, endExclusive},
+		groupColumn,
+		extraFilter,
+		extraArgs,
+		"COALESCE(SUM(count), 0)",
+	)
+}
+
+func (s *service) queryByFiltersFromTable(table, timeFilter string, timeArgs []any, groupColumn, extraFilter string, extraArgs []any, countExpr string) ([]aggregatedData, error) {
+	base := `
+		SELECT ` + groupColumn + ` AS label,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COALESCE(SUM(upload + download), 0) AS total,
+		       ` + countExpr + ` AS count
+		FROM ` + table + `
+		WHERE ` + timeFilter
+
+	args := append([]any{}, timeArgs...)
+	if extraFilter != "" {
+		base += " AND " + extraFilter
+		args = append(args, extraArgs...)
+	}
+	base += `
+		GROUP BY ` + groupColumn + `
+		ORDER BY total DESC, label ASC
+	`
+
+	rows, err := s.db.Query(base, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := make([]aggregatedData, 0)
+	for rows.Next() {
+		var item aggregatedData
+		if err := rows.Scan(&item.Label, &item.Upload, &item.Download, &item.Total, &item.Count); err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
+func (s *service) queryTrendFromRaw(start, end, bucket int64) ([]trendPoint, error) {
 	rows, err := s.db.Query(`
 		SELECT ((timestamp / ?) * ?) AS bucket_start,
 		       COALESCE(SUM(upload), 0) AS upload,
@@ -784,28 +1157,109 @@ func (s *service) queryTrend(start, end, bucket int64) ([]trendPoint, error) {
 	}
 	defer rows.Close()
 
-	buckets := make(map[int64]trendPoint)
+	results := make([]trendPoint, 0)
 	for rows.Next() {
 		var point trendPoint
 		if err := rows.Scan(&point.Timestamp, &point.Upload, &point.Download); err != nil {
 			return nil, err
 		}
-		buckets[point.Timestamp] = point
+		results = append(results, point)
 	}
-	if err := rows.Err(); err != nil {
+	return results, rows.Err()
+}
+
+func (s *service) queryTrendFromAggregates(start, endExclusive, bucket int64) ([]trendPoint, error) {
+	rows, err := s.db.Query(`
+		SELECT ((bucket_start / ?) * ?) AS bucket_start,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download
+		FROM traffic_aggregated
+		WHERE bucket_start >= ? AND bucket_start < ?
+		GROUP BY bucket_start
+		ORDER BY bucket_start ASC
+	`, bucket, bucket, start, endExclusive)
+	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
-	points := make([]trendPoint, 0, (end-start)/bucket+1)
-	for t := start; t <= end; t += bucket {
-		key := (t / bucket) * bucket
-		if point, ok := buckets[key]; ok {
-			points = append(points, point)
+	results := make([]trendPoint, 0)
+	for rows.Next() {
+		var point trendPoint
+		if err := rows.Scan(&point.Timestamp, &point.Upload, &point.Download); err != nil {
+			return nil, err
+		}
+		results = append(results, point)
+	}
+	return results, rows.Err()
+}
+
+func fullMinuteBucketRange(start, end int64) (int64, int64) {
+	aggregateStart := ((start + 60000 - 1) / 60000) * 60000
+	aggregateEndExclusive := ((end + 1) / 60000) * 60000
+	if aggregateStart < 0 {
+		aggregateStart = 0
+	}
+	if aggregateEndExclusive < 0 {
+		aggregateEndExclusive = 0
+	}
+	if aggregateStart > aggregateEndExclusive {
+		return aggregateStart, aggregateStart
+	}
+	return aggregateStart, aggregateEndExclusive
+}
+
+func mergeAggregatedDataRows(target map[string]*aggregatedData, items []aggregatedData) {
+	for _, item := range items {
+		existing, ok := target[item.Label]
+		if !ok {
+			copyItem := item
+			target[item.Label] = &copyItem
 			continue
 		}
-		points = append(points, trendPoint{Timestamp: key})
+		existing.Upload += item.Upload
+		existing.Download += item.Download
+		existing.Total += item.Total
+		existing.Count += item.Count
 	}
-	return points, nil
+}
+
+func sortedAggregatedDataRows(items map[string]*aggregatedData) []aggregatedData {
+	results := make([]aggregatedData, 0, len(items))
+	for _, item := range items {
+		results = append(results, *item)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Total == results[j].Total {
+			return results[i].Label < results[j].Label
+		}
+		return results[i].Total > results[j].Total
+	})
+	return results
+}
+
+func mergeTrendPoints(target map[int64]trendPoint, items []trendPoint) {
+	for _, item := range items {
+		existing := target[item.Timestamp]
+		existing.Timestamp = item.Timestamp
+		existing.Upload += item.Upload
+		existing.Download += item.Download
+		target[item.Timestamp] = existing
+	}
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func parseTimeRange(r *http.Request) (int64, int64, error) {

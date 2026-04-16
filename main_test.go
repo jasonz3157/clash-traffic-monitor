@@ -151,6 +151,123 @@ func TestProcessConnectionsStoresDetailFields(t *testing.T) {
 	}
 }
 
+func TestQueryAggregateLongRangeIncludesRawBoundaryData(t *testing.T) {
+	svc := newTestService(t)
+
+	insertTestLogs(t, svc.db, []trafficLog{
+		{Timestamp: 30_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 10, Download: 20},
+		{Timestamp: 60_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 30, Download: 40},
+		{Timestamp: 120_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 50, Download: 60},
+		{Timestamp: 3_660_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 70, Download: 80},
+	})
+
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: 60_000,
+			BucketEnd:   120_000,
+			SourceIP:    "192.168.1.2",
+			Host:        "a.com",
+			Process:     "chrome",
+			Outbound:    "NodeA",
+			Chains:      `["DIRECT"]`,
+			Upload:      30,
+			Download:    40,
+			Count:       1,
+		},
+		{
+			BucketStart: 120_000,
+			BucketEnd:   180_000,
+			SourceIP:    "192.168.1.2",
+			Host:        "a.com",
+			Process:     "chrome",
+			Outbound:    "NodeA",
+			Chains:      `["DIRECT"]`,
+			Upload:      50,
+			Download:    60,
+			Count:       1,
+		},
+	})
+
+	got, err := svc.queryAggregate("sourceIP", 30_000, 3_660_000)
+	if err != nil {
+		t.Fatalf("queryAggregate: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(got))
+	}
+	if got[0].Upload != 160 || got[0].Download != 200 || got[0].Total != 360 || got[0].Count != 4 {
+		t.Fatalf("unexpected aggregated result: %+v", got[0])
+	}
+}
+
+func TestQueryTrendRebucketsAggregatedMinuteData(t *testing.T) {
+	svc := newTestService(t)
+
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 60_000, BucketEnd: 120_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 10, Download: 20, Count: 1},
+		{BucketStart: 120_000, BucketEnd: 180_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 30, Download: 40, Count: 1},
+		{BucketStart: 180_000, BucketEnd: 240_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 50, Download: 60, Count: 1},
+		{BucketStart: 240_000, BucketEnd: 300_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 70, Download: 80, Count: 1},
+	})
+
+	got, err := svc.queryTrend(0, 600_000, 300_000)
+	if err != nil {
+		t.Fatalf("queryTrend: %v", err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("expected 3 buckets, got %d", len(got))
+	}
+	if got[0].Timestamp != 0 || got[0].Upload != 160 || got[0].Download != 200 {
+		t.Fatalf("unexpected first bucket: %+v", got[0])
+	}
+	if got[1].Timestamp != 300_000 || got[1].Upload != 0 || got[1].Download != 0 {
+		t.Fatalf("unexpected second bucket: %+v", got[1])
+	}
+}
+
+func TestHandleLogsClearsAggregatesAndBuffer(t *testing.T) {
+	svc := newTestService(t)
+
+	insertTestLogs(t, svc.db, []trafficLog{
+		{Timestamp: 1000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Upload: 100, Download: 200},
+	})
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 100, Download: 200, Count: 1},
+	})
+	svc.aggregateBuffer["pending"] = &aggregatedEntry{BucketStart: 60_000, BucketEnd: 120_000, SourceIP: "192.168.1.2"}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/traffic/logs", nil)
+	rec := httptest.NewRecorder()
+
+	svc.handleLogs(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var rawCount int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_logs`).Scan(&rawCount); err != nil {
+		t.Fatalf("count traffic_logs: %v", err)
+	}
+	if rawCount != 0 {
+		t.Fatalf("expected traffic_logs to be empty, got %d rows", rawCount)
+	}
+
+	var aggregateCount int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_aggregated`).Scan(&aggregateCount); err != nil {
+		t.Fatalf("count traffic_aggregated: %v", err)
+	}
+	if aggregateCount != 0 {
+		t.Fatalf("expected traffic_aggregated to be empty, got %d rows", aggregateCount)
+	}
+
+	if len(svc.aggregateBuffer) != 0 {
+		t.Fatalf("expected aggregate buffer to be empty, got %d entries", len(svc.aggregateBuffer))
+	}
+}
+
 func TestHandleConnectionDetailsReturnsGroupedDetails(t *testing.T) {
 	svc := newTestService(t)
 
@@ -240,6 +357,16 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	if !strings.Contains(html, "updateCustomInputs()\n      updateViewHints()\n      loadData()") {
 		t.Fatalf("expected initial page load to fetch data once")
 	}
+	for _, label := range []string{"1 天", "7 天", "15 天", "30 天", "自定义"} {
+		if !strings.Contains(html, label) {
+			t.Fatalf("expected range option %q to exist", label)
+		}
+	}
+	for _, label := range []string{"最近 1 小时", "最近 24 小时"} {
+		if strings.Contains(html, label) {
+			t.Fatalf("expected old range option %q to be removed", label)
+		}
+	}
 }
 
 func newTestService(t *testing.T) *service {
@@ -257,6 +384,7 @@ func newTestService(t *testing.T) *service {
 	return &service{
 		db:              db,
 		lastConnections: make(map[string]connection),
+		aggregateBuffer: make(map[string]*aggregatedEntry),
 	}
 }
 
@@ -284,6 +412,32 @@ func insertTestLogs(t *testing.T, db *sql.DB, logs []trafficLog) {
 		)
 		if err != nil {
 			t.Fatalf("insert log: %v", err)
+		}
+	}
+}
+
+func insertTestAggregates(t *testing.T, db *sql.DB, entries []aggregatedEntry) {
+	t.Helper()
+
+	for _, entry := range entries {
+		_, err := db.Exec(
+			`INSERT INTO traffic_aggregated
+			 (bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			entry.BucketStart,
+			entry.BucketEnd,
+			entry.SourceIP,
+			entry.Host,
+			entry.DestinationIP,
+			entry.Process,
+			entry.Outbound,
+			entry.Chains,
+			entry.Upload,
+			entry.Download,
+			entry.Count,
+		)
+		if err != nil {
+			t.Fatalf("insert aggregate: %v", err)
 		}
 	}
 }
