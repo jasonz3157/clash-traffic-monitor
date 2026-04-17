@@ -1,3 +1,12 @@
+
+
+
+
+# Traffic Monitor
+
+`Traffic Monitor` 是一个独立运行的 Clash 流量监控服务。
+
+它会定时读取  Clash 的 `/connections` 数据，把流量增量先聚合到内存，再按分钟桶批量写入 SQLite，并提供一个内置 Web 页面，用来查看设备、主机、代理维度的流量统计和链路明细。
 <p align="center">
   <a href="https://github.com/zhf883680/clash-traffic-monitor/stargazers"><img src="https://img.shields.io/github/stars/zhf883680/clash-traffic-monitor?style=flat-square&color=yellow" alt="Stars"></a>
   <a href="https://hub.docker.com/r/zhf883680/clash-traffic-monitor"><img src="https://img.shields.io/docker/pulls/zhf883680/clash-traffic-monitor?style=flat-square&color=2496ED&logo=docker" alt="Docker Pulls"></a>
@@ -8,11 +17,6 @@
   <img src="https://img.shields.io/badge/OpenWrt-friendly-00B5E2?style=flat-square" alt="OpenWrt Friendly">
 </p>
 
-# Traffic Monitor
-
-`Traffic Monitor` 是一个独立运行的 Clash 流量监控服务。
-
-它会定时读取  Clash 的 `/connections` 数据，把流量增量先聚合到内存，再按分钟桶批量写入 SQLite，并提供一个内置 Web 页面，用来查看设备、主机、代理维度的流量统计和链路明细。
 ## 页面预览
 
 ![Traffic Monitor 页面预览](./readmeImg/image.png)
