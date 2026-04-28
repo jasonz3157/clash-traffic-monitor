@@ -223,14 +223,14 @@ func main() {
 	}
 
 	svc := &service{
-		db:              db,
-		client:          &http.Client{Timeout: 10 * time.Second},
-		now:             time.Now,
-		cfg:             cfg,
-		mihomoSettings:  runtimeSettings,
-		lastConnections: make(map[string]connection),
-		lastVacuum:      time.Now(),
-		aggregateBuffer: make(map[string]*aggregatedEntry),
+		db:                db,
+		client:            &http.Client{Timeout: 10 * time.Second},
+		now:               time.Now,
+		cfg:               cfg,
+		mihomoSettings:    runtimeSettings,
+		lastConnections:   make(map[string]connection),
+		lastVacuum:        time.Now(),
+		aggregateBuffer:   make(map[string]*aggregatedEntry),
 		hostMinuteWindows: make(map[string]*hostTrafficWindow),
 	}
 

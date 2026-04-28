@@ -2236,6 +2236,8 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 		`id="autoSwitchBtn"`,
 		`id="autoSwitchPanel" class="panel auto-switch-panel hidden"`,
 		`id="autoSwitchCancelBtn"`,
+		`id="autoRestoreEnabled"`,
+		`id="autoRestoreQuietMinutes"`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("expected embedded index.html to contain %q", want)
@@ -2248,6 +2250,8 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 		`elements.autoSwitchBtn.addEventListener("click", openAutoSwitchPanel)`,
 		`elements.autoSwitchCancelBtn.addEventListener("click", closeAutoSwitchPanel)`,
 		`state.autoSwitchOpen = false`,
+		`autoRestoreEnabled: document.getElementById("autoRestoreEnabled")`,
+		`autoRestoreQuietMinutes: document.getElementById("autoRestoreQuietMinutes")`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("expected embedded app.js to contain %q", want)
@@ -2390,6 +2394,10 @@ func TestEmbeddedAppScriptIncludesContextualDashboardLabels(t *testing.T) {
 	script := string(content)
 	for _, want := range []string{
 		"function syncContextSummary()",
+		"const autoSwitchStatusLabels = {",
+		`restored: "已恢复原节点"`,
+		`restore_skipped: "恢复已取消"`,
+		`restore_error: "恢复失败"`,
 		`${primary} 访问的主机`,
 		`${primary} 的访问设备`,
 		`${primary} 命中的目标主机`,
