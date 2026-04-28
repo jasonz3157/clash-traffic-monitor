@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -904,6 +905,332 @@ func TestAutoSwitchCooldownSkipsNextMinuteTrigger(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("expected cooldown to prevent second event, got %d", len(events))
 	}
+}
+
+func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
+	t.Run("successful switch creates restore session", func(t *testing.T) {
+		svc := newTestService(t)
+
+		if err := saveAutoSwitchSettings(svc.db, autoSwitchSettings{
+			Enabled:                 true,
+			ThresholdBytesPerMinute: 300,
+			CooldownSeconds:         0,
+			RestoreEnabled:          true,
+			RestoreQuietMinutes:     15,
+			GroupTargets: []autoSwitchGroupTarget{
+				{GroupName: "🌍 国外媒体", TargetProxy: "🇸🇬 Singapore", Enabled: true},
+			},
+		}); err != nil {
+			t.Fatalf("saveAutoSwitchSettings: %v", err)
+		}
+
+		svc.setMihomoSettings(mihomoSettings{URL: "http://127.0.0.1:9090"})
+		currentTime := time.Date(2026, 4, 28, 12, 0, 10, 0, time.Local)
+		svc.now = func() time.Time { return currentTime }
+
+		currentProxy := "🚩 PROXY"
+		svc.client = &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/proxies":
+					body := fmt.Sprintf(`{"proxies":{"🌍 国外媒体":{"type":"Selector","all":["🚩 PROXY","🇸🇬 Singapore"],"now":%q}}}`, currentProxy)
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Header:     make(http.Header),
+					}, nil
+				case req.Method == http.MethodPut && req.URL.Path == "/proxies/🌍 国外媒体":
+					currentProxy = "🇸🇬 Singapore"
+					return &http.Response{
+						StatusCode: http.StatusNoContent,
+						Body:       io.NopCloser(strings.NewReader("")),
+						Header:     make(http.Header),
+					}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		}
+
+		first := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   100,
+				Download: 100,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+		second := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   250,
+				Download: 150,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+
+		if err := svc.processConnections(first); err != nil {
+			t.Fatalf("processConnections first: %v", err)
+		}
+		if err := svc.processConnections(second); err != nil {
+			t.Fatalf("processConnections second: %v", err)
+		}
+
+		sessions, err := listAutoRestoreSessions(svc.db)
+		if err != nil {
+			t.Fatalf("listAutoRestoreSessions: %v", err)
+		}
+		if len(sessions) != 1 {
+			t.Fatalf("expected 1 restore session, got %d", len(sessions))
+		}
+		if sessions[0].GroupName != "🌍 国外媒体" || sessions[0].OriginalProxy != "🚩 PROXY" {
+			t.Fatalf("unexpected restore session identity: %+v", sessions[0])
+		}
+		if sessions[0].CurrentProxy != "🇸🇬 Singapore" {
+			t.Fatalf("expected current proxy to track switched target, got %+v", sessions[0])
+		}
+		if sessions[0].LastTriggeredAt != currentTime.UnixMilli() {
+			t.Fatalf("expected trigger timestamp %d, got %d", currentTime.UnixMilli(), sessions[0].LastTriggeredAt)
+		}
+		if sessions[0].LastTriggeredHost != "video.example" || sessions[0].LastTriggeredBytes != 400 {
+			t.Fatalf("unexpected trigger metadata: %+v", sessions[0])
+		}
+	})
+
+	t.Run("skipped or failed switch does not create restore session", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			currentNow string
+			putStatus  int
+		}{
+			{name: "skipped", currentNow: "🇸🇬 Singapore", putStatus: http.StatusNoContent},
+			{name: "failed", currentNow: "🚩 PROXY", putStatus: http.StatusInternalServerError},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				svc := newTestService(t)
+
+				if err := saveAutoSwitchSettings(svc.db, autoSwitchSettings{
+					Enabled:                 true,
+					ThresholdBytesPerMinute: 300,
+					CooldownSeconds:         0,
+					RestoreEnabled:          true,
+					RestoreQuietMinutes:     15,
+					GroupTargets: []autoSwitchGroupTarget{
+						{GroupName: "🌍 国外媒体", TargetProxy: "🇸🇬 Singapore", Enabled: true},
+					},
+				}); err != nil {
+					t.Fatalf("saveAutoSwitchSettings: %v", err)
+				}
+
+				svc.setMihomoSettings(mihomoSettings{URL: "http://127.0.0.1:9090"})
+				currentTime := time.Date(2026, 4, 28, 12, 0, 10, 0, time.Local)
+				svc.now = func() time.Time { return currentTime }
+
+				svc.client = &http.Client{
+					Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+						switch {
+						case req.Method == http.MethodGet && req.URL.Path == "/proxies":
+							body := fmt.Sprintf(`{"proxies":{"🌍 国外媒体":{"type":"Selector","all":["🚩 PROXY","🇸🇬 Singapore"],"now":%q}}}`, tc.currentNow)
+							return &http.Response{
+								StatusCode: http.StatusOK,
+								Body:       io.NopCloser(strings.NewReader(body)),
+								Header:     make(http.Header),
+							}, nil
+						case req.Method == http.MethodPut && req.URL.Path == "/proxies/🌍 国外媒体":
+							return &http.Response{
+								StatusCode: tc.putStatus,
+								Body:       io.NopCloser(strings.NewReader("")),
+								Header:     make(http.Header),
+							}, nil
+						default:
+							t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+							return nil, nil
+						}
+					}),
+				}
+
+				first := &connectionsResponse{
+					Connections: []connection{{
+						ID:       "conn-1",
+						Upload:   100,
+						Download: 100,
+						Chains:   []string{"🌍 国外媒体"},
+						Metadata: struct {
+							SourceIP      string "json:\"sourceIP\""
+							Host          string "json:\"host\""
+							DestinationIP string "json:\"destinationIP\""
+							Process       string "json:\"process\""
+						}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+					}},
+				}
+				second := &connectionsResponse{
+					Connections: []connection{{
+						ID:       "conn-1",
+						Upload:   250,
+						Download: 150,
+						Chains:   []string{"🌍 国外媒体"},
+						Metadata: struct {
+							SourceIP      string "json:\"sourceIP\""
+							Host          string "json:\"host\""
+							DestinationIP string "json:\"destinationIP\""
+							Process       string "json:\"process\""
+						}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+					}},
+				}
+
+				if err := svc.processConnections(first); err != nil {
+					t.Fatalf("processConnections first: %v", err)
+				}
+				if err := svc.processConnections(second); err != nil && tc.name != "failed" {
+					t.Fatalf("processConnections second: %v", err)
+				}
+
+				sessions, err := listAutoRestoreSessions(svc.db)
+				if err != nil {
+					t.Fatalf("listAutoRestoreSessions: %v", err)
+				}
+				if len(sessions) != 0 {
+					t.Fatalf("expected no restore sessions for %s path, got %+v", tc.name, sessions)
+				}
+			})
+		}
+	})
+
+	t.Run("repeated trigger updates timing without losing original proxy", func(t *testing.T) {
+		svc := newTestService(t)
+
+		if err := saveAutoSwitchSettings(svc.db, autoSwitchSettings{
+			Enabled:                 true,
+			ThresholdBytesPerMinute: 300,
+			CooldownSeconds:         0,
+			RestoreEnabled:          true,
+			RestoreQuietMinutes:     15,
+			GroupTargets: []autoSwitchGroupTarget{
+				{GroupName: "🌍 国外媒体", TargetProxy: "🇸🇬 Singapore", Enabled: true},
+			},
+		}); err != nil {
+			t.Fatalf("saveAutoSwitchSettings: %v", err)
+		}
+
+		svc.setMihomoSettings(mihomoSettings{URL: "http://127.0.0.1:9090"})
+		currentTime := time.Date(2026, 4, 28, 12, 0, 10, 0, time.Local)
+		svc.now = func() time.Time { return currentTime }
+
+		currentProxy := "🚩 PROXY"
+		svc.client = &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/proxies":
+					body := fmt.Sprintf(`{"proxies":{"🌍 国外媒体":{"type":"Selector","all":["🚩 PROXY","🇸🇬 Singapore"],"now":%q}}}`, currentProxy)
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Header:     make(http.Header),
+					}, nil
+				case req.Method == http.MethodPut && req.URL.Path == "/proxies/🌍 国外媒体":
+					currentProxy = "🇸🇬 Singapore"
+					return &http.Response{
+						StatusCode: http.StatusNoContent,
+						Body:       io.NopCloser(strings.NewReader("")),
+						Header:     make(http.Header),
+					}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		}
+
+		firstMinute := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   100,
+				Download: 100,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+		firstMinuteTrigger := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   250,
+				Download: 150,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+		secondMinuteTrigger := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-2",
+				Upload:   350,
+				Download: 150,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.3", Host: "download.example", DestinationIP: "8.8.8.8", Process: "wget"},
+			}},
+		}
+
+		if err := svc.processConnections(firstMinute); err != nil {
+			t.Fatalf("processConnections firstMinute: %v", err)
+		}
+		if err := svc.processConnections(firstMinuteTrigger); err != nil {
+			t.Fatalf("processConnections firstMinuteTrigger: %v", err)
+		}
+
+		currentTime = currentTime.Add(time.Minute)
+		if err := svc.processConnections(secondMinuteTrigger); err != nil {
+			t.Fatalf("processConnections secondMinuteTrigger: %v", err)
+		}
+
+		sessions, err := listAutoRestoreSessions(svc.db)
+		if err != nil {
+			t.Fatalf("listAutoRestoreSessions: %v", err)
+		}
+		if len(sessions) != 1 {
+			t.Fatalf("expected 1 restore session after repeated triggers, got %d", len(sessions))
+		}
+		if sessions[0].OriginalProxy != "🚩 PROXY" {
+			t.Fatalf("expected original proxy to be preserved, got %+v", sessions[0])
+		}
+		if sessions[0].CurrentProxy != "🇸🇬 Singapore" {
+			t.Fatalf("expected current proxy to remain target, got %+v", sessions[0])
+		}
+		if sessions[0].LastTriggeredAt != currentTime.UnixMilli() {
+			t.Fatalf("expected timestamp to refresh to %d, got %d", currentTime.UnixMilli(), sessions[0].LastTriggeredAt)
+		}
+		if sessions[0].LastTriggeredHost != "download.example" || sessions[0].LastTriggeredBytes != 500 {
+			t.Fatalf("expected repeated trigger metadata to refresh, got %+v", sessions[0])
+		}
+	})
 }
 
 func TestCollectOnceSkipsPollingWhenMihomoURLIsUnset(t *testing.T) {

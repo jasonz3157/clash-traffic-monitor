@@ -693,6 +693,31 @@ func deleteAutoRestoreSession(db *sql.DB, groupName string) error {
 	return err
 }
 
+func getAutoRestoreSession(db *sql.DB, groupName string) (autoRestoreSession, bool, error) {
+	row := db.QueryRow(`
+		SELECT group_name, original_proxy, current_proxy, last_triggered_at, last_triggered_host, last_triggered_bytes
+		FROM auto_restore_sessions
+		WHERE group_name = ?
+	`, groupName)
+
+	var session autoRestoreSession
+	if err := row.Scan(
+		&session.GroupName,
+		&session.OriginalProxy,
+		&session.CurrentProxy,
+		&session.LastTriggeredAt,
+		&session.LastTriggeredHost,
+		&session.LastTriggeredBytes,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return autoRestoreSession{}, false, nil
+		}
+		return autoRestoreSession{}, false, err
+	}
+
+	return session, true, nil
+}
+
 func listAutoSwitchEvents(db *sql.DB, limit int) ([]autoSwitchEvent, error) {
 	if limit <= 0 {
 		limit = 20
@@ -1103,7 +1128,7 @@ func (s *service) evaluateAutoSwitch(logs []trafficLog, nowMS int64) error {
 		return nil
 	}
 
-	results, execErr := s.executeAutoSwitch(settings)
+	results, execErr := s.executeAutoSwitch(settings, nowMS, triggerHost, triggerTotal)
 	event := autoSwitchEvent{
 		TriggeredAt: nowMS,
 		Host:        triggerHost,
@@ -1178,7 +1203,7 @@ func (s *service) isAutoSwitchSuppressed(bucketStart, nowMS, cooldownSeconds int
 	return false
 }
 
-func (s *service) executeAutoSwitch(settings autoSwitchSettings) ([]autoSwitchExecutionResult, error) {
+func (s *service) executeAutoSwitch(settings autoSwitchSettings, triggeredAt int64, triggerHost string, triggerTotal int64) ([]autoSwitchExecutionResult, error) {
 	mihomo := s.currentMihomoSettings()
 	groups, err := s.listControllableProxyGroups(mihomo)
 	if err != nil {
@@ -1207,6 +1232,11 @@ func (s *service) executeAutoSwitch(settings autoSwitchSettings) ([]autoSwitchEx
 			continue
 		}
 
+		session, hasSession, err := getAutoRestoreSession(s.db, target.GroupName)
+		if err != nil {
+			return results, err
+		}
+
 		if group.Now == target.TargetProxy {
 			results = append(results, autoSwitchExecutionResult{
 				GroupName:   target.GroupName,
@@ -1214,6 +1244,15 @@ func (s *service) executeAutoSwitch(settings autoSwitchSettings) ([]autoSwitchEx
 				Status:      "skipped",
 				Message:     "already selected",
 			})
+			if settings.RestoreEnabled && settings.RestoreQuietMinutes > 0 && hasSession {
+				session.CurrentProxy = target.TargetProxy
+				session.LastTriggeredAt = triggeredAt
+				session.LastTriggeredHost = triggerHost
+				session.LastTriggeredBytes = triggerTotal
+				if err := upsertAutoRestoreSession(s.db, session); err != nil {
+					return results, err
+				}
+			}
 			continue
 		}
 
@@ -1232,6 +1271,23 @@ func (s *service) executeAutoSwitch(settings autoSwitchSettings) ([]autoSwitchEx
 			TargetProxy: target.TargetProxy,
 			Status:      "switched",
 		})
+
+		if settings.RestoreEnabled && settings.RestoreQuietMinutes > 0 {
+			originalProxy := group.Now
+			if hasSession && strings.TrimSpace(session.OriginalProxy) != "" {
+				originalProxy = session.OriginalProxy
+			}
+			if err := upsertAutoRestoreSession(s.db, autoRestoreSession{
+				GroupName:          target.GroupName,
+				OriginalProxy:      originalProxy,
+				CurrentProxy:       target.TargetProxy,
+				LastTriggeredAt:    triggeredAt,
+				LastTriggeredHost:  triggerHost,
+				LastTriggeredBytes: triggerTotal,
+			}); err != nil {
+				return results, err
+			}
+		}
 	}
 
 	return results, nil
