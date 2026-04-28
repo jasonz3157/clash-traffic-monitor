@@ -1255,12 +1255,51 @@ func (s *service) executeAutoSwitch(
 		return nil, err
 	}
 
+	enabledTargets := enabledAutoSwitchTargets(settings)
 	groupByName := make(map[string]controllableProxyGroup, len(groups))
 	for _, group := range groups {
 		groupByName[group.Name] = group
 	}
 
 	results := make([]autoSwitchExecutionResult, 0, 1)
+	visited := make(map[string]struct{})
+	return s.executeAutoSwitchChain(
+		settings,
+		mihomo,
+		groupByName,
+		enabledTargets,
+		target,
+		triggeredAt,
+		triggerHost,
+		triggerTotal,
+		visited,
+		results,
+	)
+}
+
+func (s *service) executeAutoSwitchChain(
+	settings autoSwitchSettings,
+	mihomo mihomoSettings,
+	groupByName map[string]controllableProxyGroup,
+	enabledTargets map[string]autoSwitchGroupTarget,
+	target autoSwitchGroupTarget,
+	triggeredAt int64,
+	triggerHost string,
+	triggerTotal int64,
+	visited map[string]struct{},
+	results []autoSwitchExecutionResult,
+) ([]autoSwitchExecutionResult, error) {
+	if _, seen := visited[target.GroupName]; seen {
+		results = append(results, autoSwitchExecutionResult{
+			GroupName:   target.GroupName,
+			TargetProxy: target.TargetProxy,
+			Status:      "error",
+			Message:     "cyclic auto switch target chain",
+		})
+		return results, nil
+	}
+	visited[target.GroupName] = struct{}{}
+
 	group, ok := groupByName[target.GroupName]
 	if !ok {
 		results = append(results, autoSwitchExecutionResult{
@@ -1293,7 +1332,18 @@ func (s *service) executeAutoSwitch(
 				return results, err
 			}
 		}
-		return results, nil
+		return s.continueAutoSwitchChainIfNeeded(
+			settings,
+			mihomo,
+			groupByName,
+			enabledTargets,
+			target.TargetProxy,
+			triggeredAt,
+			triggerHost,
+			triggerTotal,
+			visited,
+			results,
+		)
 	}
 
 	if err := s.switchProxyGroup(mihomo, group, target.TargetProxy); err != nil {
@@ -1329,7 +1379,51 @@ func (s *service) executeAutoSwitch(
 		}
 	}
 
-	return results, nil
+	group.Now = target.TargetProxy
+	groupByName[target.GroupName] = group
+	return s.continueAutoSwitchChainIfNeeded(
+		settings,
+		mihomo,
+		groupByName,
+		enabledTargets,
+		target.TargetProxy,
+		triggeredAt,
+		triggerHost,
+		triggerTotal,
+		visited,
+		results,
+	)
+}
+
+func (s *service) continueAutoSwitchChainIfNeeded(
+	settings autoSwitchSettings,
+	mihomo mihomoSettings,
+	groupByName map[string]controllableProxyGroup,
+	enabledTargets map[string]autoSwitchGroupTarget,
+	nextGroupName string,
+	triggeredAt int64,
+	triggerHost string,
+	triggerTotal int64,
+	visited map[string]struct{},
+	results []autoSwitchExecutionResult,
+) ([]autoSwitchExecutionResult, error) {
+	nextTarget, ok := enabledTargets[strings.TrimSpace(nextGroupName)]
+	if !ok {
+		return results, nil
+	}
+
+	return s.executeAutoSwitchChain(
+		settings,
+		mihomo,
+		groupByName,
+		enabledTargets,
+		nextTarget,
+		triggeredAt,
+		triggerHost,
+		triggerTotal,
+		visited,
+		results,
+	)
 }
 
 func autoRestoreEligible(nowMS, lastTriggeredAt, quietMinutes int64) bool {

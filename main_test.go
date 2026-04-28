@@ -1208,6 +1208,329 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 		}
 	})
 
+	t.Run("recursive switch follows enabled nested groups", func(t *testing.T) {
+		svc := newTestService(t)
+
+		if err := saveAutoSwitchSettings(svc.db, autoSwitchSettings{
+			Enabled:                 true,
+			ThresholdBytesPerMinute: 300,
+			CooldownSeconds:         0,
+			RestoreEnabled:          true,
+			RestoreQuietMinutes:     15,
+			GroupTargets: []autoSwitchGroupTarget{
+				{GroupName: "🌍 国外媒体", TargetProxy: "⏬ 大流量套餐", Enabled: true},
+				{GroupName: "⏬ 大流量套餐", TargetProxy: "🇸🇬 Singapore", Enabled: true},
+			},
+		}); err != nil {
+			t.Fatalf("saveAutoSwitchSettings: %v", err)
+		}
+
+		svc.setMihomoSettings(mihomoSettings{URL: "http://127.0.0.1:9090"})
+		currentTime := time.Date(2026, 4, 28, 12, 0, 10, 0, time.Local)
+		svc.now = func() time.Time { return currentTime }
+
+		currentProxy := map[string]string{
+			"🌍 国外媒体":   "🚩 PROXY",
+			"⏬ 大流量套餐": "🇯🇵 Japan",
+		}
+		switches := make([]string, 0, 2)
+		svc.client = &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/proxies":
+					body := fmt.Sprintf(`{"proxies":{
+						"🌍 国外媒体":{"type":"Selector","all":["🚩 PROXY","⏬ 大流量套餐"],"now":%q},
+						"⏬ 大流量套餐":{"type":"Selector","all":["🇯🇵 Japan","🇸🇬 Singapore"],"now":%q}
+					}}`, currentProxy["🌍 国外媒体"], currentProxy["⏬ 大流量套餐"])
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Header:     make(http.Header),
+					}, nil
+				case req.Method == http.MethodPut && req.URL.Path == "/proxies/🌍 国外媒体":
+					currentProxy["🌍 国外媒体"] = "⏬ 大流量套餐"
+					switches = append(switches, "🌍 国外媒体->⏬ 大流量套餐")
+					return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+				case req.Method == http.MethodPut && req.URL.Path == "/proxies/⏬ 大流量套餐":
+					currentProxy["⏬ 大流量套餐"] = "🇸🇬 Singapore"
+					switches = append(switches, "⏬ 大流量套餐->🇸🇬 Singapore")
+					return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		}
+
+		first := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   100,
+				Download: 100,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+		second := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   250,
+				Download: 150,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+
+		if err := svc.processConnections(first); err != nil {
+			t.Fatalf("processConnections first: %v", err)
+		}
+		if err := svc.processConnections(second); err != nil {
+			t.Fatalf("processConnections second: %v", err)
+		}
+
+		if len(switches) != 2 {
+			t.Fatalf("expected two recursive switches, got %v", switches)
+		}
+		if switches[0] != "🌍 国外媒体->⏬ 大流量套餐" || switches[1] != "⏬ 大流量套餐->🇸🇬 Singapore" {
+			t.Fatalf("unexpected recursive switch chain: %v", switches)
+		}
+
+		sessions, err := listAutoRestoreSessions(svc.db)
+		if err != nil {
+			t.Fatalf("listAutoRestoreSessions: %v", err)
+		}
+		if len(sessions) != 2 {
+			t.Fatalf("expected restore sessions for both switched groups, got %+v", sessions)
+		}
+		if sessions[0].GroupName != "⏬ 大流量套餐" || sessions[0].OriginalProxy != "🇯🇵 Japan" || sessions[0].CurrentProxy != "🇸🇬 Singapore" {
+			t.Fatalf("unexpected nested restore session: %+v", sessions[0])
+		}
+		if sessions[1].GroupName != "🌍 国外媒体" || sessions[1].OriginalProxy != "🚩 PROXY" || sessions[1].CurrentProxy != "⏬ 大流量套餐" {
+			t.Fatalf("unexpected root restore session: %+v", sessions[1])
+		}
+
+		events, err := listAutoSwitchEvents(svc.db, 10)
+		if err != nil {
+			t.Fatalf("listAutoSwitchEvents: %v", err)
+		}
+		if len(events) != 1 || len(events[0].Results) != 2 {
+			t.Fatalf("expected one event with full recursive chain, got %+v", events)
+		}
+	})
+
+	t.Run("recursive switch stops at non enabled group target", func(t *testing.T) {
+		svc := newTestService(t)
+
+		if err := saveAutoSwitchSettings(svc.db, autoSwitchSettings{
+			Enabled:                 true,
+			ThresholdBytesPerMinute: 300,
+			CooldownSeconds:         0,
+			RestoreEnabled:          true,
+			RestoreQuietMinutes:     15,
+			GroupTargets: []autoSwitchGroupTarget{
+				{GroupName: "🌍 国外媒体", TargetProxy: "⏬ 大流量套餐", Enabled: true},
+			},
+		}); err != nil {
+			t.Fatalf("saveAutoSwitchSettings: %v", err)
+		}
+
+		svc.setMihomoSettings(mihomoSettings{URL: "http://127.0.0.1:9090"})
+		currentTime := time.Date(2026, 4, 28, 12, 0, 10, 0, time.Local)
+		svc.now = func() time.Time { return currentTime }
+
+		var switches []string
+		svc.client = &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/proxies":
+					body := `{"proxies":{
+						"🌍 国外媒体":{"type":"Selector","all":["🚩 PROXY","⏬ 大流量套餐"],"now":"🚩 PROXY"},
+						"⏬ 大流量套餐":{"type":"Selector","all":["🇯🇵 Japan","🇸🇬 Singapore"],"now":"🇯🇵 Japan"}
+					}}`
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Header:     make(http.Header),
+					}, nil
+				case req.Method == http.MethodPut && req.URL.Path == "/proxies/🌍 国外媒体":
+					switches = append(switches, "🌍 国外媒体->⏬ 大流量套餐")
+					return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+				case req.Method == http.MethodPut && req.URL.Path == "/proxies/⏬ 大流量套餐":
+					switches = append(switches, "⏬ 大流量套餐->🇸🇬 Singapore")
+					return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		}
+
+		first := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   100,
+				Download: 100,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+		second := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   250,
+				Download: 150,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+
+		if err := svc.processConnections(first); err != nil {
+			t.Fatalf("processConnections first: %v", err)
+		}
+		if err := svc.processConnections(second); err != nil {
+			t.Fatalf("processConnections second: %v", err)
+		}
+
+		if len(switches) != 1 || switches[0] != "🌍 国外媒体->⏬ 大流量套餐" {
+			t.Fatalf("expected recursion to stop at non enabled group, got %v", switches)
+		}
+
+		sessions, err := listAutoRestoreSessions(svc.db)
+		if err != nil {
+			t.Fatalf("listAutoRestoreSessions: %v", err)
+		}
+		if len(sessions) != 1 || sessions[0].GroupName != "🌍 国外媒体" || sessions[0].CurrentProxy != "⏬ 大流量套餐" {
+			t.Fatalf("expected only root restore session when recursion stops, got %+v", sessions)
+		}
+	})
+
+	t.Run("recursive switch detects cycles", func(t *testing.T) {
+		svc := newTestService(t)
+
+		if err := saveAutoSwitchSettings(svc.db, autoSwitchSettings{
+			Enabled:                 true,
+			ThresholdBytesPerMinute: 300,
+			CooldownSeconds:         0,
+			RestoreEnabled:          true,
+			RestoreQuietMinutes:     15,
+			GroupTargets: []autoSwitchGroupTarget{
+				{GroupName: "🌍 国外媒体", TargetProxy: "⏬ 大流量套餐", Enabled: true},
+				{GroupName: "⏬ 大流量套餐", TargetProxy: "🌍 国外媒体", Enabled: true},
+			},
+		}); err != nil {
+			t.Fatalf("saveAutoSwitchSettings: %v", err)
+		}
+
+		svc.setMihomoSettings(mihomoSettings{URL: "http://127.0.0.1:9090"})
+		currentTime := time.Date(2026, 4, 28, 12, 0, 10, 0, time.Local)
+		svc.now = func() time.Time { return currentTime }
+
+		switches := make([]string, 0, 2)
+		currentProxy := map[string]string{
+			"🌍 国外媒体":   "🚩 PROXY",
+			"⏬ 大流量套餐": "🇯🇵 Japan",
+		}
+		svc.client = &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/proxies":
+					body := fmt.Sprintf(`{"proxies":{
+						"🌍 国外媒体":{"type":"Selector","all":["🚩 PROXY","⏬ 大流量套餐"],"now":%q},
+						"⏬ 大流量套餐":{"type":"Selector","all":["🇯🇵 Japan","🌍 国外媒体"],"now":%q}
+					}}`, currentProxy["🌍 国外媒体"], currentProxy["⏬ 大流量套餐"])
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Header:     make(http.Header),
+					}, nil
+				case req.Method == http.MethodPut && req.URL.Path == "/proxies/🌍 国外媒体":
+					currentProxy["🌍 国外媒体"] = "⏬ 大流量套餐"
+					switches = append(switches, "🌍 国外媒体->⏬ 大流量套餐")
+					return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+				case req.Method == http.MethodPut && req.URL.Path == "/proxies/⏬ 大流量套餐":
+					currentProxy["⏬ 大流量套餐"] = "🌍 国外媒体"
+					switches = append(switches, "⏬ 大流量套餐->🌍 国外媒体")
+					return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+				default:
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		}
+
+		first := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   100,
+				Download: 100,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+		second := &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   250,
+				Download: 150,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: "video.example", DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
+
+		if err := svc.processConnections(first); err != nil {
+			t.Fatalf("processConnections first: %v", err)
+		}
+		if err := svc.processConnections(second); err != nil {
+			t.Fatalf("processConnections second: %v", err)
+		}
+
+		if len(switches) != 2 {
+			t.Fatalf("expected cycle test to stop after two concrete switches, got %v", switches)
+		}
+
+		events, err := listAutoSwitchEvents(svc.db, 10)
+		if err != nil {
+			t.Fatalf("listAutoSwitchEvents: %v", err)
+		}
+		if len(events) != 1 || len(events[0].Results) != 3 {
+			t.Fatalf("expected cycle event to record two switches plus cycle error, got %+v", events)
+		}
+		last := events[0].Results[2]
+		if last.Status != "error" || last.Message != "cyclic auto switch target chain" {
+			t.Fatalf("expected cycle detection result, got %+v", last)
+		}
+	})
+
 	t.Run("skipped or failed switch does not create restore session", func(t *testing.T) {
 		cases := []struct {
 			name       string
