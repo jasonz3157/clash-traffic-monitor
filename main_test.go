@@ -2767,7 +2767,7 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 			t.Fatalf("expected embedded index.html to contain %q", want)
 		}
 	}
-	if !strings.Contains(script, `sendJSON("/api/settings/mihomo", "PUT", payload)`) {
+	if !strings.Contains(script, `sendJSON("/api/settings/mihomo", "PUT", mihomoPayload)`) {
 		t.Fatalf("expected embedded index.html to save mihomo settings through the settings API")
 	}
 	for _, want := range []string{

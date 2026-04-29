@@ -58,6 +58,7 @@ const elements = {
   settingsSecret: document.getElementById("settingsSecret"),
   settingsSaveBtn: document.getElementById("settingsSaveBtn"),
   settingsCancelBtn: document.getElementById("settingsCancelBtn"),
+  domainGroupingEnabled: document.getElementById("domainGroupingEnabled"),
   settingsCloseBtn: document.getElementById("settingsCloseBtn"),
   settingsBtn: document.getElementById("settingsBtn"),
   autoSwitchBtn: document.getElementById("autoSwitchBtn"),
@@ -112,6 +113,7 @@ const state = {
     url: "",
     secret: "",
   },
+  domainGroupingEnabled: false,
   settingsOpen: false,
   settingsRequired: false,
   autoSwitchOpen: false,
@@ -408,6 +410,7 @@ async function sendJSON(path, method, payload) {
 function syncSettingsForm() {
   elements.settingsUrl.value = state.mihomoSettings.url || ""
   elements.settingsSecret.value = state.mihomoSettings.secret || ""
+  elements.domainGroupingEnabled.checked = Boolean(state.domainGroupingEnabled)
 }
 
 function syncSettingsUI() {
@@ -608,11 +611,15 @@ function collectAutoSwitchGroupTargets() {
 }
 
 async function loadSettings() {
-  const settings = await fetchJSON("/api/settings/mihomo")
+  const [settings, grouping] = await Promise.all([
+    fetchJSON("/api/settings/mihomo"),
+    fetchJSON("/api/settings/domain-grouping"),
+  ])
   state.mihomoSettings = {
     url: settings.url || "",
     secret: settings.secret || "",
   }
+  state.domainGroupingEnabled = Boolean(grouping.enabled)
   state.settingsRequired = !state.mihomoSettings.url
   state.settingsOpen = state.settingsRequired
   syncSettingsForm()
@@ -659,30 +666,35 @@ function handleModalClose(event) {
 async function saveSettings(event) {
   event.preventDefault()
 
-  const payload = {
+  const mihomoPayload = {
     url: elements.settingsUrl.value.trim(),
     secret: elements.settingsSecret.value.trim(),
   }
+  const groupingPayload = { enabled: elements.domainGroupingEnabled.checked }
 
   elements.settingsSaveBtn.disabled = true
-  setStatus("正在保存 Mihomo 设置...")
+  setStatus("正在保存设置...")
 
   try {
-    const saved = await sendJSON("/api/settings/mihomo", "PUT", payload)
+    const [saved] = await Promise.all([
+      sendJSON("/api/settings/mihomo", "PUT", mihomoPayload),
+      sendJSON("/api/settings/domain-grouping", "PUT", groupingPayload),
+    ])
     state.mihomoSettings = {
       url: saved.url || "",
       secret: saved.secret || "",
     }
+    state.domainGroupingEnabled = groupingPayload.enabled
     state.settingsRequired = !state.mihomoSettings.url
     state.settingsOpen = false
     syncSettingsForm()
     syncSettingsUI()
-    setStatus("Mihomo 设置已保存")
+    setStatus("设置已保存")
     await refreshAutoSwitchData()
     await loadData()
   } catch (error) {
     console.error(error)
-    setStatus(error.message || "保存 Mihomo 设置失败", true)
+    setStatus(error.message || "保存设置失败", true)
   } finally {
     elements.settingsSaveBtn.disabled = false
   }
