@@ -75,7 +75,7 @@ jobs:
         with:
           context: ${{ env.APP_DIR }}
           file: ${{ env.APP_DIR }}/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
@@ -121,6 +121,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-macos-arm64:
+    if: ${{ false }}
     runs-on: macos-latest
 
     steps:
