@@ -37,6 +37,7 @@
                   <option value="604800000" selected>7 天</option>
                   <option value="1296000000">15 天</option>
                   <option value="2592000000">30 天</option>
+                  <option value="today">今天</option>
                   <option value="week">本周</option>
                   <option value="month">本月</option>
                   <option value="-1">自定义</option>
@@ -51,10 +52,10 @@
                 <input id="end" type="datetime-local" />
               </div>
             </div>
-            <button id="settingsBtn" class="toolbar-action ghost" type="button">连接设置</button>
-            <button id="autoSwitchBtn" class="toolbar-action ghost" type="button">自动切换</button>
+            <button id="settingsBtn" class="toolbar-action ghost hidden" type="button">连接设置</button>
+            <button id="autoSwitchBtn" class="toolbar-action ghost hidden" type="button">自动切换</button>
             <button id="refreshBtn" class="toolbar-action primary" type="button">刷新</button>
-            <button id="clearBtn" class="toolbar-action danger" type="button">清空</button>
+            <button id="clearBtn" class="toolbar-action danger hidden" type="button">清空</button>
           </div>
         </div>
       </section>
@@ -333,21 +334,6 @@
           </section>
         </section>
 
-        <footer class="panel site-footer">
-          <div class="footer-text">开源协议：MIT</div>
-          <div class="footer-links">
-            <a
-              class="footer-link"
-              href="https://github.com/zhf883680/clash-traffic-monitor"
-              target="_blank"
-              rel="noopener noreferrer"
-              >GitHub</a
-            >
-            <a class="footer-link" href="/LICENSE" target="_blank" rel="noopener noreferrer"
-              >MIT License</a
-            >
-          </div>
-        </footer>
       </div>
     </div>
 

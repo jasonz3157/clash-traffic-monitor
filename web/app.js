@@ -221,6 +221,7 @@ function getTimeRange() {
 }
 
 function resolvePresetRange(value, end = Date.now()) {
+  if (value === "today") return { start: getStartOfToday(end), end }
   if (value === "week") return { start: getStartOfCurrentWeek(end), end }
   if (value === "month") return { start: getStartOfCurrentMonth(end), end }
 
@@ -228,6 +229,12 @@ function resolvePresetRange(value, end = Date.now()) {
     start: end - Number(value),
     end,
   }
+}
+
+function getStartOfToday(timestamp) {
+  const date = new Date(timestamp)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
 }
 
 function getStartOfCurrentWeek(timestamp) {

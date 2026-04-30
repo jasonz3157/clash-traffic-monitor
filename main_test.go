@@ -2754,6 +2754,15 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 		t.Fatalf("expected embedded index.html to include mihomo settings entry points")
 	}
 	for _, want := range []string{
+		`id="settingsBtn" class="toolbar-action ghost hidden"`,
+		`id="autoSwitchBtn" class="toolbar-action ghost hidden"`,
+		`id="clearBtn" class="toolbar-action danger hidden"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("expected toolbar action to be hidden on frontend with %q", want)
+		}
+	}
+	for _, want := range []string{
 		`id="autoSwitchBtn"`,
 		`id="autoSwitchModal"`,
 		`class="modal-shell hidden"`,
@@ -2781,15 +2790,17 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 			t.Fatalf("expected embedded app.js to contain %q", want)
 		}
 	}
-	for _, label := range []string{"1 天", "7 天", "15 天", "30 天", "本周", "本月", "自定义"} {
+	for _, label := range []string{"1 天", "7 天", "15 天", "30 天", "今天", "本周", "本月", "自定义"} {
 		if !strings.Contains(html, label) {
 			t.Fatalf("expected range option %q to exist", label)
 		}
 	}
 	for _, want := range []string{
+		`value="today">今天`,
 		`value="week">本周`,
 		`value="month">本月`,
 		"function resolvePresetRange(",
+		"function getStartOfToday(",
 		"function getStartOfCurrentWeek(",
 		"function getStartOfCurrentMonth(",
 	} {
@@ -2804,7 +2815,7 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	}
 }
 
-func TestEmbeddedIndexIncludesGithubAndLicenseFooter(t *testing.T) {
+func TestEmbeddedIndexIncludesDashboardShell(t *testing.T) {
 	content, err := webAssets.ReadFile("web/index.html")
 	if err != nil {
 		t.Fatalf("read embedded index.html: %v", err)
@@ -2827,9 +2838,13 @@ func TestEmbeddedIndexIncludesGithubAndLicenseFooter(t *testing.T) {
 		`id="selectionPath"`,
 		`当前看板上下文`,
 		`Runtime Snapshot`,
+		`class="panel site-footer"`,
+		`class="footer-link"`,
+		`>GitHub<`,
+		`>MIT License<`,
 	} {
 		if strings.Contains(html, unwanted) {
-			t.Fatalf("expected embedded index.html to remove runtime summary marker %q", unwanted)
+			t.Fatalf("expected embedded index.html to remove obsolete marker %q", unwanted)
 		}
 	}
 
@@ -2842,10 +2857,6 @@ func TestEmbeddedIndexIncludesGithubAndLicenseFooter(t *testing.T) {
 		`class="panel card card-total"`,
 		`id="secondaryTitle"`,
 		`id="detailTitle"`,
-		`href="https://github.com/zhf883680/clash-traffic-monitor"`,
-		`>GitHub<`,
-		`href="/LICENSE"`,
-		`>MIT License<`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("expected embedded index.html to contain %q", want)
