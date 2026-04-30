@@ -42,13 +42,6 @@ const elements = {
   start: document.getElementById("start"),
   end: document.getElementById("end"),
   statusBanner: document.getElementById("statusBanner"),
-  runtimeSummary: document.getElementById("runtimeSummary"),
-  selectionPath: document.getElementById("selectionPath"),
-  runtimeConnectionState: document.getElementById("runtimeConnectionState"),
-  runtimeDimension: document.getElementById("runtimeDimension"),
-  runtimeRangeLabel: document.getElementById("runtimeRangeLabel"),
-  runtimeAutoSwitchState: document.getElementById("runtimeAutoSwitchState"),
-  runtimeAutoSwitchMeta: document.getElementById("runtimeAutoSwitchMeta"),
   settingsModal: document.getElementById("settingsModal"),
   settingsPanel: document.getElementById("settingsPanel"),
   settingsTitle: document.getElementById("settingsTitle"),
@@ -209,37 +202,47 @@ function updateTrendAxisLabels(points) {
 }
 
 function updateCustomInputs() {
-  const range = Number(elements.range.value)
+  const range = elements.range.value
   const end = Date.now()
-  const start = range === -1 ? end - 86400000 : end - range
+  const start = range === "-1" ? end - 86400000 : resolvePresetRange(range, end).start
   elements.start.value = nowLocalInputValue(start - end)
   elements.end.value = nowLocalInputValue(0)
 }
 
 function getTimeRange() {
-  if (Number(elements.range.value) === -1) {
+  if (elements.range.value === "-1") {
     return {
       start: new Date(elements.start.value).getTime(),
       end: new Date(elements.end.value).getTime(),
     }
   }
 
-  const end = Date.now()
+  return resolvePresetRange(elements.range.value)
+}
+
+function resolvePresetRange(value, end = Date.now()) {
+  if (value === "week") return { start: getStartOfCurrentWeek(end), end }
+  if (value === "month") return { start: getStartOfCurrentMonth(end), end }
+
   return {
+    start: end - Number(value),
     end,
-    start: end - Number(elements.range.value),
   }
 }
 
-function currentRangeLabel() {
-  if (Number(elements.range.value) === -1) {
-    const { start, end } = getTimeRange()
-    return `${formatDateTime(start)} - ${formatDateTime(end)}`
-  }
+function getStartOfCurrentWeek(timestamp) {
+  const date = new Date(timestamp)
+  const day = date.getDay() || 7
+  date.setHours(0, 0, 0, 0)
+  date.setDate(date.getDate() - day + 1)
+  return date.getTime()
+}
 
-  const option = elements.range.options[elements.range.selectedIndex]
-  const label = option?.textContent?.trim() || "7 天"
-  return `最近 ${label}`
+function getStartOfCurrentMonth(timestamp) {
+  const date = new Date(timestamp)
+  date.setDate(1)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
 }
 
 function bucketSize(start, end) {
@@ -313,47 +316,6 @@ function syncDimensionTabs() {
   })
 }
 
-function syncContextSummary() {
-  const config = drilldownConfig[elements.dimension.value] || drilldownConfig.sourceIP
-  elements.runtimeConnectionState.textContent = state.mihomoSettings.url ? "已配置" : "待配置"
-  elements.runtimeDimension.textContent = config.primaryTitle
-  elements.runtimeRangeLabel.textContent = currentRangeLabel()
-  elements.runtimeAutoSwitchState.textContent = state.autoSwitch.enabled ? "已开启" : "未开启"
-  elements.runtimeAutoSwitchMeta.textContent = buildAutoSwitchSummary()
-
-  if (!state.selectedPrimary) {
-    elements.selectionPath.textContent = `当前维度为${config.countLabel}，等待选择主分组。`
-    return
-  }
-
-  if (!state.selectedSecondary) {
-    elements.selectionPath.textContent = `${config.countLabel} / ${state.selectedPrimary}`
-    return
-  }
-
-  elements.selectionPath.textContent = `${config.countLabel} / ${state.selectedPrimary} / ${state.selectedSecondary}`
-}
-
-function buildAutoSwitchSummary() {
-  if (!state.mihomoSettings.url) return "连接 Mihomo 后可配置自动切换预案"
-  if (!state.autoSwitch.enabled) return "尚未启用自动切换预案"
-
-  const enabledGroups = state.autoSwitch.groups.filter((group) => group.enabled).length
-  const threshold = formatBytes(state.autoSwitch.thresholdBytesPerMinute || 0)
-  const cooldownMinutes = Math.max(0, Math.round(Number(state.autoSwitch.cooldownSeconds || 0) / 60))
-  const parts = [
-    `阈值 ${threshold}/分钟`,
-    `冷却 ${cooldownMinutes} 分钟`,
-    `策略组 ${enabledGroups} 个`,
-  ]
-
-  if (state.autoSwitch.restoreEnabled) {
-    parts.push(`自动恢复 ${Number(state.autoSwitch.restoreQuietMinutes || 0)} 分钟`)
-  }
-
-  return parts.join(" · ")
-}
-
 function updateViewHints() {
   const config = drilldownConfig[elements.dimension.value] || drilldownConfig.sourceIP
   const groupedHostMode = elements.dimension.value === "host" && state.domainGroupingEnabled
@@ -373,7 +335,6 @@ function updateViewHints() {
   elements.detailTitle.title = detailTitle
 
   syncDimensionTabs()
-  syncContextSummary()
 }
 
 async function fetchJSON(path, params) {
@@ -418,7 +379,6 @@ function syncSettingsUI() {
   elements.settingsModal.classList.toggle("hidden", !panelVisible)
   elements.settingsModal.setAttribute("aria-hidden", String(!panelVisible))
   elements.dashboardShell.classList.toggle("hidden", state.settingsRequired)
-  elements.runtimeSummary.classList.toggle("hidden", state.settingsRequired)
   elements.settingsCancelBtn.classList.toggle("hidden", state.settingsRequired)
   elements.settingsCloseBtn.classList.toggle("hidden", state.settingsRequired)
 
@@ -434,7 +394,6 @@ function syncSettingsUI() {
     elements.settingsSaveBtn.textContent = "保存修改"
   }
 
-  syncContextSummary()
 }
 
 function syncAutoSwitchUI() {
@@ -571,21 +530,18 @@ async function loadAutoSwitchSettings() {
   state.autoSwitch.restoreEnabled = Boolean(settings.restoreEnabled)
   state.autoSwitch.restoreQuietMinutes = Number(settings.restoreQuietMinutes || 0)
   state.autoSwitch.groupTargets = Array.isArray(settings.groupTargets) ? settings.groupTargets : []
-  syncContextSummary()
 }
 
 async function loadAutoSwitchGroups() {
   if (!state.mihomoSettings.url) {
     state.autoSwitch.groups = []
     renderAutoSwitchGroups()
-    syncContextSummary()
     return
   }
 
   const groups = await fetchJSON("/api/auto-switch/groups")
   state.autoSwitch.groups = mergeAutoSwitchGroups(groups, state.autoSwitch.groupTargets)
   renderAutoSwitchGroups()
-  syncContextSummary()
 }
 
 async function loadAutoSwitchEvents() {
@@ -727,7 +683,6 @@ async function saveAutoSwitchSettings(event) {
     state.autoSwitchOpen = false
     syncAutoSwitchForm()
     syncAutoSwitchUI()
-    syncContextSummary()
     setStatus("自动切换配置已保存")
   } catch (error) {
     console.error(error)
@@ -1203,20 +1158,17 @@ async function clearLogs() {
 }
 
 elements.range.addEventListener("change", () => {
-  if (Number(elements.range.value) !== -1) updateCustomInputs()
-  syncContextSummary()
+  if (elements.range.value !== "-1") updateCustomInputs()
   loadData()
 })
 
 elements.start.addEventListener("change", () => {
   elements.range.value = "-1"
-  syncContextSummary()
   loadData()
 })
 
 elements.end.addEventListener("change", () => {
   elements.range.value = "-1"
-  syncContextSummary()
   loadData()
 })
 

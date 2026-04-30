@@ -264,71 +264,12 @@ select {
   border-color: rgba(255, 109, 122, 0.2);
 }
 
-.runtime-summary {
-  display: grid;
-  gap: 16px;
-  padding: 18px;
-}
-
-.summary-intro {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 14px;
-  flex-wrap: wrap;
-}
-
 .summary-eyebrow {
   color: var(--accent);
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-}
-
-.summary-title {
-  margin: 6px 0 0;
-  font-size: 20px;
-}
-
-.selection-path {
-  margin: 0;
-  max-width: 520px;
-  color: var(--muted-strong);
-  line-height: 1.6;
-  text-align: right;
-}
-
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.summary-chip {
-  display: grid;
-  gap: 6px;
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.76);
-  border: 1px solid var(--line);
-}
-
-.summary-key {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.summary-value {
-  font-size: 16px;
-  font-weight: 800;
-}
-
-.summary-note {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
 }
 
 .modal-shell {
@@ -1302,10 +1243,6 @@ th {
     grid-template-columns: 1fr;
   }
 
-  .summary-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .overview-grid,
   .dashboard {
     grid-template-columns: 1fr;
@@ -1346,7 +1283,6 @@ th {
     grid-template-columns: 1fr;
   }
 
-  .summary-grid,
   .cards {
     grid-template-columns: 1fr;
   }
@@ -1397,18 +1333,10 @@ th {
     align-items: flex-start;
   }
 
-  .summary-intro {
-    flex-direction: column;
-  }
-
   .auto-switch-event-top,
   .auto-switch-event-meta {
     flex-direction: column;
     align-items: flex-start;
-  }
-
-  .selection-path {
-    text-align: left;
   }
 
   .toolbar-group {

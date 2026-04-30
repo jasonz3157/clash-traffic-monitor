@@ -37,6 +37,8 @@
                   <option value="604800000" selected>7 天</option>
                   <option value="1296000000">15 天</option>
                   <option value="2592000000">30 天</option>
+                  <option value="week">本周</option>
+                  <option value="month">本月</option>
                   <option value="-1">自定义</option>
                 </select>
               </div>
@@ -58,35 +60,6 @@
       </section>
 
       <section id="statusBanner" class="panel status-banner hidden" role="status" aria-live="polite"></section>
-
-      <section id="runtimeSummary" class="panel runtime-summary" data-region="status">
-        <div class="summary-intro">
-          <div>
-            <div class="summary-eyebrow">Runtime Snapshot</div>
-            <h2 class="summary-title">当前看板上下文</h2>
-          </div>
-          <p id="selectionPath" class="selection-path">当前还没有选中任何分组</p>
-        </div>
-        <div class="summary-grid">
-          <article class="summary-chip">
-            <span class="summary-key">连接状态</span>
-            <strong id="runtimeConnectionState" class="summary-value">待配置</strong>
-          </article>
-          <article class="summary-chip">
-            <span class="summary-key">当前维度</span>
-            <strong id="runtimeDimension" class="summary-value">设备</strong>
-          </article>
-          <article class="summary-chip">
-            <span class="summary-key">时间范围</span>
-            <strong id="runtimeRangeLabel" class="summary-value">最近 7 天</strong>
-          </article>
-          <article class="summary-chip">
-            <span class="summary-key">自动切换</span>
-            <strong id="runtimeAutoSwitchState" class="summary-value">未开启</strong>
-            <span id="runtimeAutoSwitchMeta" class="summary-note">尚未启用自动切换预案</span>
-          </article>
-        </div>
-      </section>
 
       <div id="settingsModal" class="modal-shell hidden" aria-hidden="true">
         <div class="modal-backdrop" data-modal-close="settings"></div>

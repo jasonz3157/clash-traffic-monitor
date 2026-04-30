@@ -2726,7 +2726,7 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	if !strings.Contains(script, `elements.range.addEventListener("change", () => {`) {
 		t.Fatalf("expected range change handler to exist")
 	}
-	if !strings.Contains(script, "if (Number(elements.range.value) !== -1) updateCustomInputs()") {
+	if !strings.Contains(script, `if (elements.range.value !== "-1") updateCustomInputs()`) {
 		t.Fatalf("expected preset range change to keep custom inputs in sync")
 	}
 	if !strings.Contains(script, `elements.start.addEventListener("change", () => {`) {
@@ -2781,9 +2781,20 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 			t.Fatalf("expected embedded app.js to contain %q", want)
 		}
 	}
-	for _, label := range []string{"1 天", "7 天", "15 天", "30 天", "自定义"} {
+	for _, label := range []string{"1 天", "7 天", "15 天", "30 天", "本周", "本月", "自定义"} {
 		if !strings.Contains(html, label) {
 			t.Fatalf("expected range option %q to exist", label)
+		}
+	}
+	for _, want := range []string{
+		`value="week">本周`,
+		`value="month">本月`,
+		"function resolvePresetRange(",
+		"function getStartOfCurrentWeek(",
+		"function getStartOfCurrentMonth(",
+	} {
+		if !strings.Contains(html+script, want) {
+			t.Fatalf("expected week/month range support to contain %q", want)
 		}
 	}
 	for _, label := range []string{"最近 1 小时", "最近 24 小时"} {
@@ -2811,9 +2822,18 @@ func TestEmbeddedIndexIncludesGithubAndLicenseFooter(t *testing.T) {
 		}
 	}
 
-	for _, want := range []string{
+	for _, unwanted := range []string{
 		`id="runtimeSummary"`,
 		`id="selectionPath"`,
+		`当前看板上下文`,
+		`Runtime Snapshot`,
+	} {
+		if strings.Contains(html, unwanted) {
+			t.Fatalf("expected embedded index.html to remove runtime summary marker %q", unwanted)
+		}
+	}
+
+	for _, want := range []string{
 		`id="overviewSection"`,
 		`id="drilldownSection"`,
 		`class="panel card card-count"`,
@@ -2917,7 +2937,6 @@ func TestEmbeddedAppScriptIncludesContextualDashboardLabels(t *testing.T) {
 
 	script := string(content)
 	for _, want := range []string{
-		"function syncContextSummary()",
 		"const autoSwitchStatusLabels = {",
 		`restored: "已恢复原节点"`,
 		`restore_skipped: "恢复已取消"`,
@@ -2925,10 +2944,8 @@ func TestEmbeddedAppScriptIncludesContextualDashboardLabels(t *testing.T) {
 		`${primary} 访问的主机`,
 		`${primary} 的访问设备`,
 		`${primary} 命中的目标主机`,
-		`selectionPath: document.getElementById("selectionPath")`,
 		`secondaryTitle: document.getElementById("secondaryTitle")`,
 		`detailTitle: document.getElementById("detailTitle")`,
-		`elements.selectionPath.textContent =`,
 		`elements.secondaryTitle.textContent =`,
 		`elements.secondaryTitle.title =`,
 		`elements.detailTitle.textContent =`,
@@ -2936,6 +2953,16 @@ func TestEmbeddedAppScriptIncludesContextualDashboardLabels(t *testing.T) {
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("expected embedded app.js to contain %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"function syncContextSummary()",
+		`selectionPath: document.getElementById("selectionPath")`,
+		`elements.selectionPath.textContent =`,
+		`runtimeSummary: document.getElementById("runtimeSummary")`,
+	} {
+		if strings.Contains(script, unwanted) {
+			t.Fatalf("expected embedded app.js to remove runtime summary marker %q", unwanted)
 		}
 	}
 }

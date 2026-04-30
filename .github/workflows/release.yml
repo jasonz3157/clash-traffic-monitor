@@ -11,7 +11,7 @@ permissions:
 
 env:
   APP_DIR: .
-  IMAGE_NAME: zhf883680/clash-traffic-monitor
+  IMAGE_NAME: jasonz3157/clash-traffic-monitor
 
 jobs:
   build-and-upload:
@@ -19,21 +19,21 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: binary
-            goos: linux
-            goarch: amd64
-            cc: gcc
-            ext: ""
-          - target: binary
-            goos: linux
-            goarch: arm64
-            cc: aarch64-linux-gnu-gcc
-            ext: ""
-          - target: binary
-            goos: windows
-            goarch: amd64
-            cc: x86_64-w64-mingw32-gcc
-            ext: ".exe"
+          # - target: binary
+          #   goos: linux
+          #   goarch: amd64
+          #   cc: gcc
+          #   ext: ""
+          # - target: binary
+          #   goos: linux
+          #   goarch: arm64
+          #   cc: aarch64-linux-gnu-gcc
+          #   ext: ""
+          # - target: binary
+          #   goos: windows
+          #   goarch: amd64
+          #   cc: x86_64-w64-mingw32-gcc
+          #   ext: ".exe"
           - target: docker
             platform: linux/amd64
           - target: docker
