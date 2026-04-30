@@ -36,8 +36,8 @@ jobs:
           #   ext: ".exe"
           - target: docker
             platform: linux/amd64
-          - target: docker
-            platform: linux/arm64
+          # - target: docker
+          #   platform: linux/arm64
 
     steps:
       - uses: actions/checkout@v4
