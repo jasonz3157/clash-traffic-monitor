@@ -11,3 +11,6 @@ __debug*
 .idea/
 .docs/
 /traffic-monitor
+CLAUDE.md
+release/
+vendor/

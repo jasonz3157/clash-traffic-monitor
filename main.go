@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -168,21 +169,22 @@ type mihomoProxiesResponse struct {
 }
 
 type service struct {
-	db                *sql.DB
-	client            *http.Client
-	now               func() time.Time
-	cfg               config
-	mu                sync.Mutex
-	mihomoSettings    mihomoSettings
-	lastConnections   map[string]connection
-	lastUploadTotal   int64
-	lastDownloadTotal int64
-	lastAutoSwitchAt  int64
-	lastAutoSwitchMin int64
-	lastCleanup       time.Time
-	lastVacuum        time.Time
-	aggregateBuffer   map[string]*aggregatedEntry
-	hostMinuteWindows map[string]*hostTrafficWindow
+	db                    *sql.DB
+	client                *http.Client
+	now                   func() time.Time
+	cfg                   config
+	mu                    sync.Mutex
+	mihomoSettings        mihomoSettings
+	domainGroupingEnabled bool
+	lastConnections       map[string]connection
+	lastUploadTotal       int64
+	lastDownloadTotal     int64
+	lastAutoSwitchAt      int64
+	lastAutoSwitchMin     int64
+	lastCleanup           time.Time
+	lastVacuum            time.Time
+	aggregateBuffer       map[string]*aggregatedEntry
+	hostMinuteWindows     map[string]*hostTrafficWindow
 }
 
 type aggregatedEntry struct {
@@ -222,16 +224,19 @@ func main() {
 		log.Fatalf("resolve mihomo settings: %v", err)
 	}
 
+	domainGroupingEnabled := loadDomainGroupingEnabled(db)
+
 	svc := &service{
-		db:                db,
-		client:            &http.Client{Timeout: 10 * time.Second},
-		now:               time.Now,
-		cfg:               cfg,
-		mihomoSettings:    runtimeSettings,
-		lastConnections:   make(map[string]connection),
-		lastVacuum:        time.Now(),
-		aggregateBuffer:   make(map[string]*aggregatedEntry),
-		hostMinuteWindows: make(map[string]*hostTrafficWindow),
+		db:                    db,
+		client:                &http.Client{Timeout: 10 * time.Second},
+		now:                   time.Now,
+		cfg:                   cfg,
+		mihomoSettings:        runtimeSettings,
+		domainGroupingEnabled: domainGroupingEnabled,
+		lastConnections:       make(map[string]connection),
+		lastVacuum:            time.Now(),
+		aggregateBuffer:       make(map[string]*aggregatedEntry),
+		hostMinuteWindows:     make(map[string]*hostTrafficWindow),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -466,6 +471,28 @@ func saveMihomoSettings(db *sql.DB, settings mihomoSettings) error {
 	}
 
 	return tx.Commit()
+}
+
+func loadDomainGroupingEnabled(db *sql.DB) bool {
+	var value string
+	err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'domain_grouping_enabled'`).Scan(&value)
+	if err != nil {
+		return true // default on
+	}
+	return value == "true"
+}
+
+func saveDomainGroupingEnabled(db *sql.DB, enabled bool) error {
+	value := "false"
+	if enabled {
+		value = "true"
+	}
+	_, err := db.Exec(`
+		INSERT INTO app_settings (key, value)
+		VALUES ('domain_grouping_enabled', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, value)
+	return err
 }
 
 func resolveMihomoSettings(db *sql.DB, envURL, envSecret string) (mihomoSettings, error) {
@@ -978,6 +1005,22 @@ func (s *service) updateMihomoSettings(settings mihomoSettings) error {
 		return err
 	}
 	s.setMihomoSettings(settings)
+	return nil
+}
+
+func (s *service) currentDomainGroupingEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.domainGroupingEnabled
+}
+
+func (s *service) updateDomainGroupingEnabled(enabled bool) error {
+	if err := saveDomainGroupingEnabled(s.db, enabled); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.domainGroupingEnabled = enabled
+	s.mu.Unlock()
 	return nil
 }
 
@@ -1627,6 +1670,25 @@ func (s *service) cleanupOldLogs(nowMS int64) error {
 	return nil
 }
 
+// normalizeHost returns the eTLD+1 of host, stripping subdomains.
+// Bare IPs and single-label names are returned unchanged.
+// This is the sole seam for a future Public Suffix List upgrade.
+func normalizeHost(host string) string {
+	// Strip port if present (e.g. "example.com:443").
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	// Return bare IPs unchanged.
+	if net.ParseIP(host) != nil {
+		return host
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) <= 2 {
+		return host
+	}
+	return parts[len(parts)-2] + "." + parts[len(parts)-1]
+}
+
 func (s *service) addToAggregateBuffer(logs []trafficLog, nowMS int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1751,6 +1813,7 @@ func (s *service) routes() http.Handler {
 	mux.Handle("/", fileServer)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/settings/mihomo", s.handleMihomoSettings)
+	mux.HandleFunc("/api/settings/domain-grouping", s.handleDomainGroupingSettings)
 	mux.HandleFunc("/api/auto-switch/settings", s.handleAutoSwitchSettings)
 	mux.HandleFunc("/api/auto-switch/groups", s.handleAutoSwitchGroups)
 	mux.HandleFunc("/api/auto-switch/events", s.handleAutoSwitchEvents)
@@ -1825,6 +1888,29 @@ func (s *service) handleMihomoSettings(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeJSON(w, http.StatusOK, s.currentMihomoSettings())
+	default:
+		writeMethodNotAllowed(w)
+	}
+}
+
+func (s *service) handleDomainGroupingSettings(w http.ResponseWriter, r *http.Request) {
+	type domainGroupingResponse struct {
+		Enabled bool `json:"enabled"`
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, domainGroupingResponse{Enabled: s.currentDomainGroupingEnabled()})
+	case http.MethodPut:
+		var payload domainGroupingResponse
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid json body"))
+			return
+		}
+		if err := s.updateDomainGroupingEnabled(payload.Enabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, domainGroupingResponse{Enabled: s.currentDomainGroupingEnabled()})
 	default:
 		writeMethodNotAllowed(w)
 	}
@@ -1922,7 +2008,8 @@ func (s *service) handleAggregate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.queryAggregate(dimension, start, end)
+	raw := r.URL.Query().Get("raw") == "1"
+	data, err := s.queryAggregate(dimension, start, end, raw)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -2001,7 +2088,8 @@ func (s *service) handleDevicesByHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.queryByFilters("source_ip", "host = ?", []any{host}, start, end)
+	hostFilter, hostArgs := s.hostFilterArgs(host)
+	data, err := s.queryByFilters("source_ip", hostFilter, hostArgs, start, end)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -2127,12 +2215,47 @@ func (s *service) handleLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *service) queryAggregate(dimension string, start, end int64) ([]aggregatedData, error) {
+func (s *service) queryAggregate(dimension string, start, end int64, raw bool) ([]aggregatedData, error) {
 	column, err := dimensionColumn(dimension)
 	if err != nil {
 		return nil, err
 	}
-	return s.queryByFilters(column, "", nil, start, end)
+	rows, err := s.queryByFilters(column, "", nil, start, end)
+	if err != nil {
+		return nil, err
+	}
+	if column == "host" && !raw && s.currentDomainGroupingEnabled() {
+		rows = groupHostRows(rows)
+	}
+	return rows, nil
+}
+
+func groupHostRows(rows []aggregatedData) []aggregatedData {
+	merged := make(map[string]*aggregatedData, len(rows))
+	for _, row := range rows {
+		key := normalizeHost(row.Label)
+		existing, ok := merged[key]
+		if !ok {
+			copyRow := row
+			copyRow.Label = key
+			merged[key] = &copyRow
+			continue
+		}
+		existing.Upload += row.Upload
+		existing.Download += row.Download
+		existing.Total += row.Total
+		existing.Count += row.Count
+	}
+	return sortedAggregatedDataRows(merged)
+}
+
+// hostFilterArgs returns a SQL filter and args for matching a host column.
+// When domain grouping is enabled, expands a normalized host to also match subdomains via LIKE.
+func (s *service) hostFilterArgs(host string) (string, []any) {
+	if s.currentDomainGroupingEnabled() {
+		return "(host = ? OR host LIKE ?)", []any{host, "%." + host}
+	}
+	return "host = ?", []any{host}
 }
 
 func (s *service) querySubstats(dimension, label string, start, end int64) ([]aggregatedData, error) {
@@ -2141,7 +2264,11 @@ func (s *service) querySubstats(dimension, label string, start, end int64) ([]ag
 		return nil, err
 	}
 	if column == "host" {
-		return nil, errors.New("host is not supported for substats")
+		if !s.currentDomainGroupingEnabled() {
+			return nil, errors.New("host substats require domain grouping to be enabled")
+		}
+		hostFilter, hostArgs := s.hostFilterArgs(label)
+		return s.queryByFilters("host", hostFilter, hostArgs, start, end)
 	}
 	return s.queryByFilters("host", column+" = ?", []any{label}, start, end)
 }
@@ -2175,6 +2302,17 @@ func (s *service) queryConnectionDetails(dimension, primary, secondary string, s
 	filter, args, err := detailFilter(dimension, primary, secondary)
 	if err != nil {
 		return nil, err
+	}
+	if dimension == "host" && s.currentDomainGroupingEnabled() {
+		if net.ParseIP(secondary) == nil {
+			// secondary is a raw subdomain — show all source IPs for that host
+			filter = "host = ?"
+			args = []any{secondary}
+		} else {
+			hostFilter, hostArgs := s.hostFilterArgs(primary)
+			filter = hostFilter + " AND source_ip = ?"
+			args = append(hostArgs, secondary)
+		}
 	}
 
 	rows, err := s.db.Query(`
@@ -2452,22 +2590,55 @@ func matchesAggregateEntryFilters(entry aggregatedEntry, filter string, args []a
 	}
 
 	clauses := strings.Split(filter, " AND ")
-	if len(clauses) != len(args) {
-		return false
-	}
-
-	for i, clause := range clauses {
+	argIdx := 0
+	for _, clause := range clauses {
+		clause = strings.TrimSpace(clause)
+		if argIdx >= len(args) {
+			return false
+		}
+		// Handle compound clause: (col = ? OR col LIKE ?)
+		// Used for normalized-host LIKE expansion. Consumes 2 args.
+		if strings.HasPrefix(clause, "(") && strings.HasSuffix(clause, ")") {
+			if argIdx+1 >= len(args) {
+				return false
+			}
+			inner := clause[1 : len(clause)-1]
+			parts := strings.SplitN(inner, " OR ", 2)
+			if len(parts) != 2 {
+				return false
+			}
+			col := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(parts[0]), "= ?"))
+			col = strings.TrimSpace(strings.TrimSuffix(col, " = ?"))
+			fieldVal := aggregateEntryFieldValue(entry, col)
+			exactVal := fmt.Sprint(args[argIdx])
+			likePattern := fmt.Sprint(args[argIdx+1])
+			if fieldVal != exactVal && !matchesLikePattern(fieldVal, likePattern) {
+				return false
+			}
+			argIdx += 2
+			continue
+		}
+		// Handle simple clause: col = ?
 		column := strings.TrimSpace(strings.TrimSuffix(clause, "= ?"))
 		column = strings.TrimSpace(strings.TrimSuffix(column, " = ?"))
 		if column == "" {
 			return false
 		}
-		if aggregateEntryFieldValue(entry, column) != fmt.Sprint(args[i]) {
+		if aggregateEntryFieldValue(entry, column) != fmt.Sprint(args[argIdx]) {
 			return false
 		}
+		argIdx++
 	}
 
-	return true
+	return argIdx == len(args)
+}
+
+// matchesLikePattern matches the "%.suffix" pattern (prefix wildcard only).
+func matchesLikePattern(value, pattern string) bool {
+	if strings.HasPrefix(pattern, "%.") {
+		return strings.HasSuffix(value, pattern[1:])
+	}
+	return value == pattern
 }
 
 func aggregateEntryFieldValue(entry aggregatedEntry, column string) string {

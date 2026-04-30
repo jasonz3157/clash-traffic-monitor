@@ -25,7 +25,7 @@ func TestQueryAggregate(t *testing.T) {
 		{BucketStart: 60_000, BucketEnd: 120_000, SourceIP: "192.168.1.3", Host: "a.com", Process: "curl", Outbound: "DIRECT", Chains: `["DIRECT"]`, Upload: 10, Download: 30, Count: 1},
 	})
 
-	got, err := svc.queryAggregate("sourceIP", 1, 120_000)
+	got, err := svc.queryAggregate("sourceIP", 1, 120_000, false)
 	if err != nil {
 		t.Fatalf("queryAggregate: %v", err)
 	}
@@ -2462,7 +2462,7 @@ func TestQueryAggregateIncludesBufferedData(t *testing.T) {
 		Count:         1,
 	}
 
-	got, err := svc.queryAggregate("sourceIP", 60_000, 180_000)
+	got, err := svc.queryAggregate("sourceIP", 60_000, 180_000, false)
 	if err != nil {
 		t.Fatalf("queryAggregate: %v", err)
 	}
@@ -2767,7 +2767,7 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 			t.Fatalf("expected embedded index.html to contain %q", want)
 		}
 	}
-	if !strings.Contains(script, `sendJSON("/api/settings/mihomo", "PUT", payload)`) {
+	if !strings.Contains(script, `sendJSON("/api/settings/mihomo", "PUT", mihomoPayload)`) {
 		t.Fatalf("expected embedded index.html to save mihomo settings through the settings API")
 	}
 	for _, want := range []string{
@@ -3048,11 +3048,12 @@ func newTestService(t *testing.T) *service {
 	})
 
 	return &service{
-		db:                db,
-		now:               time.Now,
-		lastConnections:   make(map[string]connection),
-		aggregateBuffer:   make(map[string]*aggregatedEntry),
-		hostMinuteWindows: make(map[string]*hostTrafficWindow),
+		db:                    db,
+		now:                   time.Now,
+		domainGroupingEnabled: loadDomainGroupingEnabled(db),
+		lastConnections:       make(map[string]connection),
+		aggregateBuffer:       make(map[string]*aggregatedEntry),
+		hostMinuteWindows:     make(map[string]*hostTrafficWindow),
 	}
 }
 
@@ -3114,4 +3115,380 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestDomainGroupingEnabled(t *testing.T) {
+	svc := newTestService(t)
+
+	// Default: no row in DB → returns true
+	if got := loadDomainGroupingEnabled(svc.db); !got {
+		t.Fatal("expected default to be true")
+	}
+
+	// Save false, reload
+	if err := saveDomainGroupingEnabled(svc.db, false); err != nil {
+		t.Fatalf("saveDomainGroupingEnabled(false): %v", err)
+	}
+	if got := loadDomainGroupingEnabled(svc.db); got {
+		t.Fatal("expected false after saving false")
+	}
+
+	// Save true, reload
+	if err := saveDomainGroupingEnabled(svc.db, true); err != nil {
+		t.Fatalf("saveDomainGroupingEnabled(true): %v", err)
+	}
+	if got := loadDomainGroupingEnabled(svc.db); !got {
+		t.Fatal("expected true after saving true")
+	}
+}
+
+func TestHandleDomainGroupingSettings(t *testing.T) {
+	svc := newTestService(t)
+
+	t.Run("GET returns default true", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings/domain-grouping", nil)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["enabled"] != true {
+			t.Fatalf("expected enabled=true, got %v", resp["enabled"])
+		}
+	})
+
+	t.Run("PUT sets false", func(t *testing.T) {
+		body := bytes.NewBufferString(`{"enabled":false}`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/domain-grouping", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["enabled"] != false {
+			t.Fatalf("expected enabled=false, got %v", resp["enabled"])
+		}
+		if svc.currentDomainGroupingEnabled() {
+			t.Fatal("expected in-memory state to be false")
+		}
+	})
+
+	t.Run("PUT sets true", func(t *testing.T) {
+		body := bytes.NewBufferString(`{"enabled":true}`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/domain-grouping", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status %d: %s", rec.Code, rec.Body.String())
+		}
+		if !svc.currentDomainGroupingEnabled() {
+			t.Fatal("expected in-memory state to be true")
+		}
+	})
+
+	t.Run("PUT bad JSON returns 400", func(t *testing.T) {
+		body := bytes.NewBufferString(`not-json`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/domain-grouping", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rec.Code)
+		}
+	})
+
+	t.Run("DELETE returns 405", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/settings/domain-grouping", nil)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405, got %d", rec.Code)
+		}
+	})
+}
+
+func TestNormalizeHost(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"r1---sn-abc.googlevideo.com", "googlevideo.com"},
+		{"www.youtube.com", "youtube.com"},
+		{"91.108.56.111", "91.108.56.111"},
+		{"2001:db8::1", "2001:db8::1"},
+		{"youtube.com", "youtube.com"},
+		{"localhost", "localhost"},
+		{"example.com:443", "example.com"},
+		{"sub.sub.example.com", "example.com"},
+	}
+	for _, c := range cases {
+		got := normalizeHost(c.input)
+		if got != c.want {
+			t.Errorf("normalizeHost(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+func TestGroupHostRows(t *testing.T) {
+	rows := []aggregatedData{
+		{Label: "r1---sn-abc.googlevideo.com", Upload: 100, Download: 200, Total: 300, Count: 1},
+		{Label: "r4---sn-xyz.googlevideo.com", Upload: 50, Download: 80, Total: 130, Count: 2},
+		{Label: "www.youtube.com", Upload: 10, Download: 20, Total: 30, Count: 1},
+		{Label: "91.108.56.111", Upload: 5, Download: 5, Total: 10, Count: 1},
+	}
+	got := groupHostRows(rows)
+
+	byLabel := make(map[string]aggregatedData, len(got))
+	for _, r := range got {
+		byLabel[r.Label] = r
+	}
+
+	gv, ok := byLabel["googlevideo.com"]
+	if !ok {
+		t.Fatal("expected googlevideo.com in result")
+	}
+	if gv.Upload != 150 || gv.Download != 280 || gv.Total != 430 || gv.Count != 3 {
+		t.Errorf("googlevideo.com unexpected: %+v", gv)
+	}
+
+	yt, ok := byLabel["youtube.com"]
+	if !ok {
+		t.Fatal("expected youtube.com in result")
+	}
+	if yt.Upload != 10 || yt.Download != 20 || yt.Total != 30 {
+		t.Errorf("youtube.com unexpected: %+v", yt)
+	}
+
+	ip, ok := byLabel["91.108.56.111"]
+	if !ok {
+		t.Fatal("expected bare IP in result")
+	}
+	if ip.Total != 10 {
+		t.Errorf("bare IP unexpected: %+v", ip)
+	}
+
+	if len(got) != 3 {
+		t.Errorf("expected 3 rows after grouping, got %d", len(got))
+	}
+}
+
+func TestQueryAggregateHostGrouping(t *testing.T) {
+	t.Run("groups subdomains when enabled", func(t *testing.T) {
+		svc := newTestService(t)
+		insertTestAggregates(t, svc.db, []aggregatedEntry{
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r4---sn-xyz.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 80, Count: 2},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "www.youtube.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 10, Download: 20, Count: 1},
+		})
+
+		rows, err := svc.queryAggregate("host", 0, 60_000, false)
+		if err != nil {
+			t.Fatalf("queryAggregate: %v", err)
+		}
+
+		byLabel := make(map[string]aggregatedData)
+		for _, r := range rows {
+			byLabel[r.Label] = r
+		}
+
+		gv, ok := byLabel["googlevideo.com"]
+		if !ok {
+			t.Fatal("expected googlevideo.com grouped row")
+		}
+		if gv.Upload != 150 || gv.Download != 280 || gv.Count != 3 {
+			t.Errorf("googlevideo.com unexpected: %+v", gv)
+		}
+		if _, raw := byLabel["r1---sn-abc.googlevideo.com"]; raw {
+			t.Error("raw subdomain r1---sn-abc.googlevideo.com should not appear when grouping enabled")
+		}
+		if len(rows) != 2 {
+			t.Errorf("expected 2 rows (googlevideo.com + youtube.com), got %d: %v", len(rows), rows)
+		}
+	})
+
+	t.Run("returns raw hosts when grouping disabled", func(t *testing.T) {
+		svc := newTestService(t)
+		if err := svc.updateDomainGroupingEnabled(false); err != nil {
+			t.Fatalf("updateDomainGroupingEnabled: %v", err)
+		}
+		insertTestAggregates(t, svc.db, []aggregatedEntry{
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r4---sn-xyz.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 80, Count: 2},
+		})
+
+		rows, err := svc.queryAggregate("host", 0, 60_000, false)
+		if err != nil {
+			t.Fatalf("queryAggregate: %v", err)
+		}
+		if len(rows) != 2 {
+			t.Errorf("expected 2 raw rows when grouping disabled, got %d", len(rows))
+		}
+	})
+
+	t.Run("non-host dimensions are not grouped", func(t *testing.T) {
+		svc := newTestService(t)
+		insertTestAggregates(t, svc.db, []aggregatedEntry{
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.3", Host: "r4---sn-xyz.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 80, Count: 1},
+		})
+
+		rows, err := svc.queryAggregate("sourceIP", 0, 60_000, false)
+		if err != nil {
+			t.Fatalf("queryAggregate: %v", err)
+		}
+		if len(rows) != 2 {
+			t.Errorf("expected 2 rows for sourceIP dimension, got %d", len(rows))
+		}
+	})
+}
+
+func TestQueryAggregateRawPassthrough(t *testing.T) {
+	svc := newTestService(t)
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r4---sn-xyz.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 80, Count: 2},
+	})
+
+	t.Run("raw=false groups subdomains", func(t *testing.T) {
+		rows, err := svc.queryAggregate("host", 0, 60_000, false)
+		if err != nil {
+			t.Fatalf("queryAggregate: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Errorf("expected 1 grouped row, got %d: %v", len(rows), rows)
+		}
+		if rows[0].Label != "googlevideo.com" {
+			t.Errorf("expected label googlevideo.com, got %s", rows[0].Label)
+		}
+	})
+
+	t.Run("raw=true bypasses grouping", func(t *testing.T) {
+		rows, err := svc.queryAggregate("host", 0, 60_000, true)
+		if err != nil {
+			t.Fatalf("queryAggregate: %v", err)
+		}
+		if len(rows) != 2 {
+			t.Errorf("expected 2 raw rows, got %d: %v", len(rows), rows)
+		}
+		labels := make(map[string]bool)
+		for _, r := range rows {
+			labels[r.Label] = true
+		}
+		if !labels["r1---sn-abc.googlevideo.com"] || !labels["r4---sn-xyz.googlevideo.com"] {
+			t.Errorf("expected raw subdomain labels, got %v", labels)
+		}
+	})
+}
+
+func TestQuerySubstatsHostGrouping(t *testing.T) {
+	t.Run("returns raw subdomains for normalized host when grouping enabled", func(t *testing.T) {
+		svc := newTestService(t)
+		insertTestAggregates(t, svc.db, []aggregatedEntry{
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r4---sn-xyz.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 80, Count: 2},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "www.youtube.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 10, Download: 20, Count: 1},
+		})
+
+		rows, err := svc.querySubstats("host", "googlevideo.com", 0, 60_000)
+		if err != nil {
+			t.Fatalf("querySubstats: %v", err)
+		}
+		if len(rows) != 2 {
+			t.Errorf("expected 2 subdomain rows, got %d: %v", len(rows), rows)
+		}
+		byLabel := make(map[string]aggregatedData)
+		for _, r := range rows {
+			byLabel[r.Label] = r
+		}
+		if _, ok := byLabel["r1---sn-abc.googlevideo.com"]; !ok {
+			t.Error("expected r1---sn-abc.googlevideo.com in results")
+		}
+		if _, ok := byLabel["r4---sn-xyz.googlevideo.com"]; !ok {
+			t.Error("expected r4---sn-xyz.googlevideo.com in results")
+		}
+		if _, ok := byLabel["www.youtube.com"]; ok {
+			t.Error("www.youtube.com should not appear in googlevideo.com substats")
+		}
+	})
+
+	t.Run("returns error when grouping disabled", func(t *testing.T) {
+		svc := newTestService(t)
+		if err := svc.updateDomainGroupingEnabled(false); err != nil {
+			t.Fatalf("updateDomainGroupingEnabled: %v", err)
+		}
+		_, err := svc.querySubstats("host", "googlevideo.com", 0, 60_000)
+		if err == nil {
+			t.Fatal("expected error for host substats when grouping disabled")
+		}
+	})
+
+	t.Run("exact match passes through for bare IP label", func(t *testing.T) {
+		svc := newTestService(t)
+		insertTestAggregates(t, svc.db, []aggregatedEntry{
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "192.0.2.1", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+			{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "example.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 10, Download: 20, Count: 1},
+		})
+
+		rows, err := svc.querySubstats("host", "192.0.2.1", 0, 60_000)
+		if err != nil {
+			t.Fatalf("querySubstats: %v", err)
+		}
+		if len(rows) != 1 {
+			t.Errorf("expected 1 row for bare IP, got %d: %v", len(rows), rows)
+		}
+		if rows[0].Label != "192.0.2.1" {
+			t.Errorf("expected label 192.0.2.1, got %s", rows[0].Label)
+		}
+	})
+}
+
+func TestConnectionDetailsSubdomainSecondary(t *testing.T) {
+	svc := newTestService(t)
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.3", Host: "r1---sn-abc.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 50, Download: 80, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "r4---sn-xyz.googlevideo.com", Outbound: "NodeA", Chains: `["NodeA"]`, Upload: 10, Download: 20, Count: 1},
+	})
+
+	// secondary is a raw subdomain — should return all source IPs for that host
+	details, err := svc.queryConnectionDetails("host", "googlevideo.com", "r1---sn-abc.googlevideo.com", 0, 60_000)
+	if err != nil {
+		t.Fatalf("queryConnectionDetails: %v", err)
+	}
+	if len(details) != 2 {
+		t.Errorf("expected 2 detail rows (one per source IP), got %d: %v", len(details), details)
+	}
+	sourceIPs := make(map[string]bool)
+	for _, d := range details {
+		sourceIPs[d.SourceIP] = true
+	}
+	if !sourceIPs["192.168.1.2"] || !sourceIPs["192.168.1.3"] {
+		t.Errorf("expected both source IPs, got %v", sourceIPs)
+	}
+
+	// secondary is a source IP — existing behaviour unchanged
+	details, err = svc.queryConnectionDetails("host", "googlevideo.com", "192.168.1.2", 0, 60_000)
+	if err != nil {
+		t.Fatalf("queryConnectionDetails (IP secondary): %v", err)
+	}
+	if len(details) == 0 {
+		t.Error("expected results for source IP secondary")
+	}
+	for _, d := range details {
+		if d.SourceIP != "192.168.1.2" {
+			t.Errorf("expected only source IP 192.168.1.2, got %s", d.SourceIP)
+		}
+	}
 }
