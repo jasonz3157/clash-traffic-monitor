@@ -2808,6 +2808,12 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 			t.Fatalf("expected week/month range support to contain %q", want)
 		}
 	}
+	if !strings.Contains(html, `<option value="month" selected>本月</option>`) {
+		t.Fatalf("expected month range to be selected by default")
+	}
+	if strings.Contains(html, `<option value="604800000" selected>7 天</option>`) {
+		t.Fatalf("expected 7 day range to stop being selected by default")
+	}
 	for _, label := range []string{"最近 1 小时", "最近 24 小时"} {
 		if strings.Contains(html, label) {
 			t.Fatalf("expected old range option %q to be removed", label)
