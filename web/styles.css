@@ -1,10 +1,10 @@
 :root {
-  --bg: #f3f6fb;
-  --bg-soft: #edf2f8;
-  --panel: rgba(255, 255, 255, 0.92);
+  --bg: #ffffff;
+  --bg-soft: #f1f5f9;
+  --panel: #f8fafc;
   --panel-strong: #ffffff;
-  --line: #dbe5f0;
-  --line-strong: #c2d2e4;
+  --line: #d8e2ee;
+  --line-strong: #b8c7d9;
   --text: #1e2a3a;
   --muted: #748399;
   --muted-strong: #5b6a7f;
@@ -15,7 +15,7 @@
   --up: #3db8ff;
   --down: #31d184;
   --danger: #ff6d7a;
-  --shadow: 0 18px 40px rgba(61, 76, 99, 0.08);
+  --shadow: 0 18px 40px rgba(61, 76, 99, 0.1);
   --radius-xl: 26px;
   --radius-lg: 20px;
   --radius-md: 16px;
@@ -32,10 +32,7 @@ html,
 body {
   margin: 0;
   min-height: 100%;
-  background:
-    radial-gradient(circle at top left, rgba(95, 70, 255, 0.08), transparent 30%),
-    radial-gradient(circle at top right, rgba(61, 184, 255, 0.08), transparent 26%),
-    linear-gradient(180deg, #f8fbff 0%, #eef3f8 100%);
+  background: var(--bg);
   color: var(--text);
   font-family:
     "Segoe UI", "PingFang SC", "Noto Sans SC", "Helvetica Neue", sans-serif;
@@ -64,10 +61,9 @@ select {
 .panel {
   position: relative;
   background: var(--panel);
-  border: 1px solid rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--line);
   border-radius: var(--radius-xl);
   box-shadow: var(--shadow);
-  backdrop-filter: blur(14px);
 }
 
 .topbar {
@@ -601,6 +597,8 @@ select {
 }
 
 .card {
+  background: #f7f9fd;
+  border-color: #d4dfec;
   padding: 12px 14px;
   min-height: 0;
 }
