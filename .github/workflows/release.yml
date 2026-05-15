@@ -1,8 +1,7 @@
 name: Traffic Monitor Release
 
 on:
-  release:
-    types: [created]
+  push:
   workflow_dispatch:
 
 permissions:
