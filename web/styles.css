@@ -852,7 +852,23 @@ table {
 }
 
 .secondary-table {
-  min-width: 760px;
+  min-width: 620px;
+  table-layout: fixed;
+}
+
+.secondary-table th:first-child,
+.secondary-table td:first-child {
+  width: 54px;
+}
+
+.secondary-table th:nth-child(2),
+.secondary-table td:nth-child(2) {
+  width: 300px;
+}
+
+.secondary-table th:nth-child(n + 3),
+.secondary-table td:nth-child(n + 3) {
+  width: 88px;
 }
 
 .detail-table {
